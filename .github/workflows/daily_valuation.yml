@@ -14,14 +14,13 @@ jobs:
   valuation-push:
     runs-on: ubuntu-latest
     steps:
-      - name: 1. 检出仓库代码与 indices.json 配置文件
+      - name: 1. 检出仓库代码与配置文件
         uses: actions/checkout@v4
 
       - name: 2. 配置 Python 3.11 环境
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'
 
       - name: 3. 安装中文字体与 Python 依赖库
         run: |
@@ -37,15 +36,20 @@ jobs:
           python valuation_push.py --config indices.json --output-png valuation_chart.png --output-html valuation_report.html --skip-push
 
       - name: 5. 将最新估值看板图片发布至 output-chart 分支（供微信内高清大图展示）
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
+          cp valuation_chart.png /tmp/valuation_chart.png
+          mkdir -p /tmp/chart_repo
+          cd /tmp/chart_repo
+          git init
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git checkout --orphan temp-chart-branch
-          git rm -rf --cached .
-          git add -f valuation_chart.png
+          cp /tmp/valuation_chart.png ./valuation_chart.png
+          git add valuation_chart.png
           git commit -m "Update daily valuation chart"
-          git push origin HEAD:refs/heads/output-chart --force
-          git checkout -f ${{ github.ref_name }}
+          git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:refs/heads/output-chart --force || true
 
       - name: 6. 推送估值图表与数据晚报至个人微信
         env:
