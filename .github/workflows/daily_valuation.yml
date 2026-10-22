@@ -2,7 +2,7 @@ name: Daily Index Valuation WeChat Push
 
 on:
   schedule:
-    - cron: '0 10 * * *'
+    - cron: '0 8 * * *'
   workflow_dispatch:
 
 permissions:
