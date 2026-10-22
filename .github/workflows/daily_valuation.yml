@@ -1,0 +1,36 @@
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 3. 安装中文字体与 Python 依赖库
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fonts-noto-cjk
+          pip install --upgrade pip
+          pip install pandas openpyxl matplotlib numpy requests akshare
+
+      - name: 4. 计算近 5 年 PE 百分位并生成估值图表与 HTML 报表
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          python valuation_push.py --excel indices.xlsx --output-png valuation_chart.png --output-html valuation_report.html --skip-push
+
+      - name: 5. 将最新估值看板图片发布至 output-chart 分支（供微信内高清大图展示）
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout --orphan temp-chart-branch
+          git rm -rf --cached .
+          git add -f valuation_chart.png
+          git commit -m "Update daily valuation chart"
+          git push origin HEAD:refs/heads/output-chart --force
+          git checkout -f ${{ github.ref_name }}
+
+      - name: 6. 推送估值图表与数据晚报至个人微信
+        env:
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+          PUSHPLUS_TOPIC: ${{ secrets.PUSHPLUS_TOPIC }}
+          WECOM_WEBHOOK_KEY: ${{ secrets.WECOM_WEBHOOK_KEY }}
+        run: |
+          python valuation_push.py --output-png valuation_chart.png --output-html valuation_report.html --send-only
