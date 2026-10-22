@@ -14,7 +14,7 @@ jobs:
   valuation-push:
     runs-on: ubuntu-latest
     steps:
-      - name: 1. 检出仓库代码与 Excel 文件
+      - name: 1. 检出仓库代码与 indices.json 配置文件
         uses: actions/checkout@v4
 
       - name: 2. 配置 Python 3.11 环境
@@ -28,13 +28,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y fonts-noto-cjk
           pip install --upgrade pip
-          pip install pandas openpyxl matplotlib numpy requests akshare
+          pip install pandas matplotlib numpy requests akshare openpyxl
 
-      - name: 4. 计算近 5 年 PE 百分位并生成估值图表与 HTML 报表
+      - name: 4. 读取 indices.json 计算近 5 年 PE 百分位并生成估值图表
         env:
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
-          python valuation_push.py --excel indices.xlsx --output-png valuation_chart.png --output-html valuation_report.html --skip-push
+          python valuation_push.py --config indices.json --output-png valuation_chart.png --output-html valuation_report.html --skip-push
 
       - name: 5. 将最新估值看板图片发布至 output-chart 分支（供微信内高清大图展示）
         run: |
