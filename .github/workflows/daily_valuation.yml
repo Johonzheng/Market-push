@@ -1,3 +1,23 @@
+name: Daily Index Valuation WeChat Push
+
+on:
+  # 每天北京时间晚上 18:00 自动执行 (GitHub Actions 使用 UTC 时间，18:00 CST = 10:00 UTC)
+  schedule:
+    - cron: '0 10 * * *'
+  # 支持在 GitHub 页面手动点击 "Run workflow" 立即测试推送
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  valuation-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 1. 检出仓库代码与 Excel 文件
+        uses: actions/checkout@v4
+
+      - name: 2. 配置 Python 3.11 环境
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
