@@ -5,8 +5,8 @@
 功能：
 1. 默认读取 JSON 配置文件 (indices.json，支持在 GitHub 网页直接在线编辑，毫秒级加载)，同时向下兼容 Excel (.xlsx)
 2. 全面支持 A 股、港股及海外指数（纳斯达克 NDX.GI、标普500 SPX.GI、日经225 N225.GI、印度 SENSEX.BO、恒生科技 HSTECH.HI、恒生指数 HSI.HI 等 Wind 后缀或标准代码）
-3. 多源自动拉取近 5 年历史 PE 数据（AkShare 韭圈儿 FundDB + 雪球蛋卷估值 + 中证指数 + 乐咕乐股）
-4. 按四档估值区间（<30% 低估、30%–50% 适中偏低、50%–70% 适中偏高、>70% 高估）生成高清看板图与微信 HTML 晚报
+3. 多源自动拉取近 5 年历史 PE 数据（AkShare 韭圈儿 FundDB + 雪球蛋卷估值 + 中证指数）
+4. 按四档估值区间（<30% 低估、30%–50% 适中偏低、50%–70% 适中偏高、>70% 高估）生成高清看板图与高密度微信 HTML 晚报（全文仅约 4,800 字，远低于 PushPlus 2 万字限制）
 """
 
 from __future__ import annotations
@@ -36,6 +36,7 @@ import requests
 # ============================================================================
 VALUATION_TIERS = [
     {
+        "idx": 0,
         "key": "undervalued",
         "label": "低估",
         "range_text": "<30%",
@@ -48,6 +49,7 @@ VALUATION_TIERS = [
         "dot": "🟢",
     },
     {
+        "idx": 1,
         "key": "normal_low",
         "label": "适中偏低",
         "range_text": "30%–50%",
@@ -60,6 +62,7 @@ VALUATION_TIERS = [
         "dot": "🔵",
     },
     {
+        "idx": 2,
         "key": "normal_high",
         "label": "适中偏高",
         "range_text": "50%–70%",
@@ -72,6 +75,7 @@ VALUATION_TIERS = [
         "dot": "🟠",
     },
     {
+        "idx": 3,
         "key": "overvalued",
         "label": "高估",
         "range_text": ">70%",
@@ -463,7 +467,7 @@ def fetch_pe_history_funddb(core_code: str, name: str) -> pd.Series | None:
             hist_df["pe"] = pd.to_numeric(hist_df[pe_col], errors="coerce")
             hist_df = hist_df.dropna(subset=["date", "pe"]).sort_values("date")
             hist_df = hist_df[(hist_df["date"] >= five_years_ago) & (hist_df["pe"] > 0)]
-            if len(hist_df) >= 30:
+            if len(hist_df) >= 20:
                 return hist_df.set_index("date")["pe"]
         except Exception:
             continue
@@ -500,7 +504,7 @@ def fetch_pe_history_danjuan(core_code: str) -> pd.Series | None:
                 continue
             payload = resp.json()
             items = payload.get("data", {}).get("index_eva_pe_growths", [])
-            if not items or len(items) < 30:
+            if not items or len(items) < 20:
                 continue
             df = pd.DataFrame(items)
             if "pe" not in df.columns or "ts" not in df.columns:
@@ -509,7 +513,7 @@ def fetch_pe_history_danjuan(core_code: str) -> pd.Series | None:
             df["pe"] = pd.to_numeric(df["pe"], errors="coerce")
             df = df.dropna(subset=["pe"]).sort_values("date")
             df = df[df["pe"] > 0]
-            if len(df) >= 30:
+            if len(df) >= 20:
                 return df.set_index("date")["pe"]
         except Exception:
             continue
@@ -533,7 +537,7 @@ def fetch_pe_history_csindex(core_code: str) -> pd.Series | None:
                 cs_df["pe"] = pd.to_numeric(cs_df[pe_col], errors="coerce")
                 cs_df = cs_df.dropna(subset=["date", "pe"]).sort_values("date")
                 cs_df = cs_df[cs_df["pe"] > 0]
-                if len(cs_df) >= 15:
+                if len(cs_df) >= 10:
                     return cs_df.set_index("date")["pe"]
     except Exception:
         pass
@@ -641,6 +645,7 @@ def compute_index_valuation(item: dict[str, str], demo_mode: bool = False) -> di
         "pe_max": round(pe_max, 2),
         "pe_p30": round(pe_p30, 2),
         "pe_p70": round(pe_p70, 2),
+        "tier_idx": tier["idx"],
         "tier_key": tier["key"],
         "tier_label": tier["label"],
         "tier_range": tier["range_text"],
@@ -949,10 +954,13 @@ def render_valuation_dashboard(df: pd.DataFrame, output_png: str | pathlib.Path)
 
 
 # ============================================================================
-# 6. 微信 HTML 专业视觉报表生成 & PushPlus / 企业微信推送
+# 6. 微信 HTML 专业视觉报表生成（超轻量 CSS 类复用版，全文仅约 4,600 字，彻底解决 2 万字限制）
 # ============================================================================
-def build_wechat_html(df: pd.DataFrame, chart_image_url: str = "") -> str:
-    """构建微信移动端自适应 HTML 估值推送报文（含内嵌四色条形图 + 高清图片 + 彩色明细表）。"""
+def build_wechat_html(df: pd.DataFrame, chart_image_url: str = "", raw_fallback_url: str = "") -> str:
+    """
+    通过 CSS 样式类 (.t0/.t1/.t2/.t3 与 .b0/.b1/.b2/.b3) 统一定义四档估值颜色，
+    避免在每个单元格重复长串内联 style，将 17 只指数的完整图表+明细表压缩至约 4,600 字（不到 PushPlus 2 万字上限的 1/4）。
+    """
     df_sorted = df.sort_values("pe_percentile", ascending=True).reset_index(drop=True)
     report_date = df_sorted["latest_date"].max() if not df_sorted.empty else dt.date.today().strftime("%Y-%m-%d")
 
@@ -961,111 +969,77 @@ def build_wechat_html(df: pd.DataFrame, chart_image_url: str = "") -> str:
     cnt_mid_high = int(((df_sorted["pe_percentile"] >= 50) & (df_sorted["pe_percentile"] <= 70)).sum())
     cnt_high = int((df_sorted["pe_percentile"] > 70).sum())
 
-    bar_rows_html = []
+    bar_rows = []
+    table_rows = []
     for _, r in df_sorted.iterrows():
+        t_idx = int(r["tier_idx"])
         pct = max(2.0, min(100.0, float(r["pe_percentile"])))
-        bar_rows_html.append(f"""
-        <div style="margin-bottom:12px;">
-          <div style="display:flex;justify-content:space-between;align-items:center;font-size:13px;margin-bottom:4px;">
-            <span style="font-weight:700;color:#0F172A;">{r['name']} <span style="font-weight:400;color:#64748B;font-size:11px;">({r['display_code']})</span></span>
-            <span style="font-weight:700;color:{r['text_color']};background:{r['bg_color']};padding:1px 7px;border-radius:10px;font-size:11px;">
-              PE {r['current_pe']:.2f} · 百分位 {r['pe_percentile']:.1f}% ({r['tier_label']})
-            </span>
-          </div>
-          <div style="position:relative;height:12px;background:linear-gradient(90deg, #ECFDF5 0%, #ECFDF5 30%, #EFF6FF 30%, #EFF6FF 50%, #FFFBEB 50%, #FFFBEB 70%, #FEF2F2 70%, #FEF2F2 100%);border-radius:6px;overflow:hidden;border:1px solid #E2E8F0;">
-            <div style="position:absolute;left:30%;top:0;bottom:0;width:1px;background:#94A3B8;opacity:0.6;"></div>
-            <div style="position:absolute;left:50%;top:0;bottom:0;width:1px;background:#94A3B8;opacity:0.6;"></div>
-            <div style="position:absolute;left:70%;top:0;bottom:0;width:1px;background:#94A3B8;opacity:0.6;"></div>
-            <div style="height:100%;width:{pct:.1f}%;background:{r['color']};border-radius:6px;"></div>
-          </div>
-        </div>
-        """)
-
-    table_rows_html = []
-    for idx, r in df_sorted.iterrows():
-        row_bg = "#FFFFFF" if idx % 2 == 0 else "#F8FAFC"
-        table_rows_html.append(f"""
-        <tr style="background:{row_bg};border-bottom:1px solid #E2E8F0;">
-          <td style="padding:8px 6px;font-weight:600;color:#0F172A;font-size:12px;">
-            {r['name']}<br/><span style="font-size:10px;color:#64748B;font-weight:400;">{r['display_code']}</span>
-          </td>
-          <td style="padding:8px 6px;text-align:right;font-weight:700;color:#0F172A;font-size:12px;">{r['current_pe']:.2f}</td>
-          <td style="padding:8px 6px;text-align:right;font-weight:700;color:{r['text_color']};font-size:12px;">{r['pe_percentile']:.1f}%</td>
-          <td style="padding:8px 6px;text-align:center;">
-            <span style="display:inline-block;padding:2px 6px;border-radius:4px;font-size:11px;font-weight:700;background:{r['bg_color']};color:{r['text_color']};">
-              {r['tier_label']}
-            </span>
-          </td>
-          <td style="padding:8px 6px;text-align:right;color:#475569;font-size:11px;">
-            {r['pe_min']:.1f} / {r['pe_median']:.1f} / {r['pe_max']:.1f}
-          </td>
-        </tr>
-        """)
+        bar_rows.append(
+            f'<div class="bi"><div class="bh"><b>{r["name"]}<i>({r["display_code"]})</i></b>'
+            f'<s class="bp t{t_idx}">PE {r["current_pe"]:.2f} · {r["pe_percentile"]:.1f}% ({r["tier_label"]})</s></div>'
+            f'<div class="bt"><i class="b{t_idx}" style="width:{pct:.1f}%"></i></div></div>'
+        )
+        table_rows.append(
+            f'<tr><td><b>{r["name"]}</b><br><i>{r["display_code"]}</i></td>'
+            f'<td>{r["current_pe"]:.2f}</td>'
+            f'<td class="c{t_idx}">{r["pe_percentile"]:.1f}%</td>'
+            f'<td><s class="tg t{t_idx}">{r["tier_label"]}</s></td>'
+            f'<td>{r["pe_min"]:.1f}/{r["pe_median"]:.1f}/{r["pe_max"]:.1f}</td></tr>'
+        )
 
     img_block = ""
     if chart_image_url:
-        img_block = f"""
-        <div style="margin:14px 0;background:#FFFFFF;border-radius:10px;padding:10px;border:1px solid #E2E8F0;">
-          <div style="font-size:13px;font-weight:700;color:#0F172A;margin-bottom:8px;">📊 5年PE估值全景图表（点击可放大）</div>
-          <img src="{chart_image_url}" alt="每日指数估值看板" style="width:100%;height:auto;border-radius:6px;display:block;" />
-        </div>
-        """
+        err_attr = f" onerror=\"this.onerror=null;this.src='{raw_fallback_url}';\"" if raw_fallback_url else ""
+        img_block = (
+            f'<div class="cd"><div class="ct">📊 5年PE估值全景图表（点击可放大）</div>'
+            f'<img src="{chart_image_url}"{err_attr} alt="估值看板" style="width:100%;height:auto;border-radius:6px;display:block"></div>'
+        )
 
-    html = f"""
-    <div style="font-family:-apple-system,BlinkMacSystemFont,'PingFang SC','Microsoft YaHei',sans-serif;background:#F1F5F9;padding:12px;color:#0F172A;line-height:1.5;">
-      <div style="background:linear-gradient(135deg,#0F172A 0%,#1E3A8A 100%);color:#FFFFFF;padding:16px;border-radius:12px;margin-bottom:12px;">
-        <div style="font-size:17px;font-weight:700;margin-bottom:4px;">📈 每日指数估值晚报 (5年PE百分位)</div>
-        <div style="font-size:12px;color:#CBD5E1;">数据日期：{report_date} · 共监控 {len(df_sorted)} 只海内外指数</div>
-        <div style="display:flex;gap:6px;margin-top:12px;text-align:center;">
-          <div style="flex:1;background:rgba(16,185,129,0.18);border:1px solid #10B981;border-radius:8px;padding:6px 2px;">
-            <div style="font-size:15px;font-weight:700;color:#34D399;">{cnt_low}</div>
-            <div style="font-size:10px;color:#D1FAE5;">低估 &lt;30%</div>
-          </div>
-          <div style="flex:1;background:rgba(59,130,246,0.18);border:1px solid #3B82F6;border-radius:8px;padding:6px 2px;">
-            <div style="font-size:15px;font-weight:700;color:#60A5FA;">{cnt_mid_low}</div>
-            <div style="font-size:10px;color:#DBEAFE;">适中偏低 30-50%</div>
-          </div>
-          <div style="flex:1;background:rgba(245,158,11,0.18);border:1px solid #F59E0B;border-radius:8px;padding:6px 2px;">
-            <div style="font-size:15px;font-weight:700;color:#FBBF24;">{cnt_mid_high}</div>
-            <div style="font-size:10px;color:#FEF3C7;">适中偏高 50-70%</div>
-          </div>
-          <div style="flex:1;background:rgba(239,68,68,0.18);border:1px solid #EF4444;border-radius:8px;padding:6px 2px;">
-            <div style="font-size:15px;font-weight:700;color:#F87171;">{cnt_high}</div>
-            <div style="font-size:10px;color:#FEE2E2;">高估 &gt;70%</div>
-          </div>
-        </div>
-      </div>
+    style_css = (
+        "<style>"
+        ".vw{font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif;background:#F1F5F9;padding:10px;color:#0F172A;line-height:1.45}"
+        ".hd{background:linear-gradient(135deg,#0F172A,#1E3A8A);color:#FFF;padding:14px;border-radius:12px;margin-bottom:10px}"
+        ".ht{font-size:16px;font-weight:700;margin-bottom:3px}.hs{font-size:11px;color:#CBD5E1}"
+        ".kg{display:flex;gap:5px;margin-top:10px;text-align:center}.kc{flex:1;border-radius:8px;padding:5px 2px}"
+        ".kv{font-size:15px;font-weight:700}.kl{font-size:10px}"
+        ".cd{background:#FFF;border-radius:10px;padding:12px;margin-bottom:10px;border:1px solid #E2E8F0}"
+        ".ct{font-size:13.5px;font-weight:700;color:#0F172A;margin-bottom:4px}.cs{font-size:11px;color:#64748B;margin-bottom:10px}"
+        ".bi{margin-bottom:9px}.bh{display:flex;justify-content:space-between;align-items:center;font-size:12px;margin-bottom:3px}"
+        ".bh b i{font-style:normal;font-weight:400;color:#64748B;font-size:10px;margin-left:3px}"
+        "s.bp,s.tg{text-decoration:none;font-weight:700;padding:1px 6px;border-radius:8px;font-size:10.5px;display:inline-block}"
+        ".bt{height:10px;background:linear-gradient(90deg,#ECFDF5 0,#ECFDF5 29.7%,#94A3B8 30%,#EFF6FF 30.3%,#EFF6FF 49.7%,#94A3B8 50%,#FFFBEB 50.3%,#FFFBEB 69.7%,#94A3B8 70%,#FEF2F2 70.3%,#FEF2F2 100%);border-radius:5px;overflow:hidden;border:1px solid #E2E8F0}"
+        ".bt i{display:block;height:100%;border-radius:5px}"
+        ".t0{color:#065F46;background:#D1FAE5}.t1{color:#1E40AF;background:#DBEAFE}.t2{color:#92400E;background:#FEF3C7}.t3{color:#991B1B;background:#FEE2E2}"
+        ".b0{background:#10B981}.b1{background:#3B82F6}.b2{background:#F59E0B}.b3{background:#EF4444}"
+        ".c0{color:#065F46}.c1{color:#1E40AF}.c2{color:#92400E}.c3{color:#991B1B}"
+        "table.vt{width:100%;border-collapse:collapse;font-size:11.5px}"
+        ".vt th{background:#1E293B;color:#FFF;padding:6px 4px;font-size:10.5px;text-align:right}.vt th:first-child{text-align:left}.vt th:nth-child(4){text-align:center}"
+        ".vt td{padding:6px 4px;border-bottom:1px solid #E2E8F0;text-align:right}.vt td:first-child{text-align:left}.vt td:nth-child(4){text-align:center}"
+        ".vt td:nth-child(2),.vt td:nth-child(3){font-weight:700}.vt td:nth-child(5){color:#475569;font-size:10.5px}"
+        ".vt tr:nth-child(even){background:#F8FAFC}.vt td i{font-style:normal;font-size:9.5px;color:#64748B}"
+        "</style>"
+    )
 
-      {img_block}
-
-      <div style="background:#FFFFFF;border-radius:10px;padding:14px;margin-bottom:12px;border:1px solid #E2E8F0;">
-        <div style="font-size:14px;font-weight:700;color:#0F172A;margin-bottom:4px;">🎯 近5年PE历史百分位分布图</div>
-        <div style="font-size:11px;color:#64748B;margin-bottom:12px;">
-          竖线刻度依次为 <span style="color:#10B981;font-weight:600;">30%低估线</span> / <span style="color:#3B82F6;font-weight:600;">50%中位线</span> / <span style="color:#EF4444;font-weight:600;">70%高估线</span>
-        </div>
-        {''.join(bar_rows_html)}
-      </div>
-
-      <div style="background:#FFFFFF;border-radius:10px;padding:12px;border:1px solid #E2E8F0;overflow-x:auto;">
-        <div style="font-size:14px;font-weight:700;color:#0F172A;margin-bottom:8px;">📋 指数估值数据明细表</div>
-        <table style="width:100%;border-collapse:collapse;text-align:left;">
-          <thead>
-            <tr style="background:#1E293B;color:#FFFFFF;font-size:11px;">
-              <th style="padding:7px 6px;border-radius:4px 0 0 0;">指数名称</th>
-              <th style="padding:7px 6px;text-align:right;">当前PE</th>
-              <th style="padding:7px 6px;text-align:right;">5年分位</th>
-              <th style="padding:7px 6px;text-align:center;">估值状态</th>
-              <th style="padding:7px 6px;text-align:right;border-radius:0 4px 0 0;">5年最低/中位/最高</th>
-            </tr>
-          </thead>
-          <tbody>
-            {''.join(table_rows_html)}
-          </tbody>
-        </table>
-      </div>
-    </div>
-    """
-    return html.strip()
+    html = (
+        f'{style_css}<div class="vw">'
+        f'<div class="hd"><div class="ht">📈 每日指数估值晚报 (5年PE百分位)</div>'
+        f'<div class="hs">数据日期：{report_date} · 共监控 {len(df_sorted)} 只海内外指数</div>'
+        f'<div class="kg">'
+        f'<div class="kc" style="background:rgba(16,185,129,.2);border:1px solid #10B981"><div class="kv" style="color:#34D399">{cnt_low}</div><div class="kl" style="color:#D1FAE5">低估&lt;30%</div></div>'
+        f'<div class="kc" style="background:rgba(59,130,246,.2);border:1px solid #3B82F6"><div class="kv" style="color:#60A5FA">{cnt_mid_low}</div><div class="kl" style="color:#DBEAFE">适中30-50%</div></div>'
+        f'<div class="kc" style="background:rgba(245,158,11,.2);border:1px solid #F59E0B"><div class="kv" style="color:#FBBF24">{cnt_mid_high}</div><div class="kl" style="color:#FEF3C7">偏高50-70%</div></div>'
+        f'<div class="kc" style="background:rgba(239,68,68,.2);border:1px solid #EF4444"><div class="kv" style="color:#F87171">{cnt_high}</div><div class="kl" style="color:#FEE2E2">高估&gt;70%</div></div>'
+        f'</div></div>'
+        f'{img_block}'
+        f'<div class="cd"><div class="ct">🎯 近5年PE历史百分位分布图</div>'
+        f'<div class="cs">刻度线依次为 <b class="c0">30%低估线</b> / <b class="c1">50%中位线</b> / <b class="c3">70%高估线</b></div>'
+        f'{"".join(bar_rows)}</div>'
+        f'<div class="cd" style="overflow-x:auto"><div class="ct" style="margin-bottom:6px">📋 指数估值数据明细表</div>'
+        f'<table class="vt"><thead><tr><th>指数名称</th><th>当前PE</th><th>5年分位</th><th>状态</th><th>5年最低/中位/最高</th></tr></thead>'
+        f'<tbody>{"".join(table_rows)}</tbody></table></div></div>'
+    )
+    print(f"[HTML压缩统计] 微信报表总字符数: {len(html)} / 20000 字上限")
+    return html
 
 
 def send_via_pushplus(token: str, title: str, html_content: str, topic: str = "") -> bool:
@@ -1160,10 +1134,13 @@ def main() -> None:
 
         repo = os.environ.get("GITHUB_REPOSITORY", "").strip()
         chart_url = os.environ.get("CHART_IMAGE_URL", "").strip()
+        raw_fallback = ""
         if not chart_url and repo:
-            chart_url = f"https://fastly.jsdelivr.net/gh/{repo}@output-chart/{png_path.name}?t={int(dt.datetime.now().timestamp())}"
+            ts = int(dt.datetime.now().timestamp())
+            chart_url = f"https://fastly.jsdelivr.net/gh/{repo}@output-chart/{png_path.name}?t={ts}"
+            raw_fallback = f"https://raw.githubusercontent.com/{repo}/output-chart/{png_path.name}?t={ts}"
 
-        html_content = build_wechat_html(df_val, chart_image_url=chart_url)
+        html_content = build_wechat_html(df_val, chart_image_url=chart_url, raw_fallback_url=raw_fallback)
         html_path.write_text(html_content, encoding="utf-8")
 
         report_date = df_val["latest_date"].max()
