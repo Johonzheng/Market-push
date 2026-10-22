@@ -63,13 +63,6 @@
     "note": "孟买SENSEX30 / MSCI印度 (935600)"
   },
   {
-    "code": "H11001.CSI",
-    "name": "中证全债",
-    "market": "债券指数",
-    "enabled": false,
-    "note": "纯债指数无PE市盈率指标，默认设为false跳过"
-  },
-  {
     "code": "SPX.GI",
     "name": "标普500",
     "market": "海外美股",
@@ -94,23 +87,9 @@
     "enabled": true
   },
   {
-    "code": "980092.CNI",
-    "name": "自由现金",
-    "market": "A股策略",
-    "enabled": true,
-    "note": "国证自由现金流指数"
-  },
-  {
     "code": "000510.SH",
     "name": "中证A500",
     "market": "A股宽基",
     "enabled": true
   },
-  {
-    "code": "930915.CSI",
-    "name": "港股通高",
-    "market": "港股策略",
-    "enabled": true,
-    "note": "中证港股通高股息投资指数"
-  }
 ]
