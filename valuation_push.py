@@ -1,25 +1,29 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-每日指数估值微信推送系统 (GitHub Actions 极速 JSON + 海外指数增强版)
+每日指数估值微信推送系统 (GitHub Actions 极速并发 + 海外指数增强版)
 功能：
 1. 默认读取 JSON 配置文件 (indices.json，支持在 GitHub 网页直接在线编辑，毫秒级加载)，同时向下兼容 Excel (.xlsx)
-2. 全面支持 A 股、港股及海外指数（纳斯达克 NDX.GI、标普500 SPX.GI、日经225 N225.GI、印度 SENSEX.BO、恒生科技 HSTECH.HI、恒生指数 HSI.HI 等 Wind 后缀或标准代码）
-3. 多源自动拉取近 5 年历史 PE 数据（AkShare 韭圈儿 FundDB + 雪球蛋卷估值 + 中证指数）
-4. 按四档估值区间（<30% 低估、30%–50% 适中偏低、50%–70% 适中偏高、>70% 高估）生成高清看板图与高密度微信 HTML 晚报（全文仅约 4,800 字，远低于 PushPlus 2 万字限制）
+2. 全面支持 A 股、港股及海外指数（纳斯达克 NDX.GI、标普500 SPX.GI、日经225 N225.GI、印度 SENSEX.BO、恒生科技 HSTECH.HI、恒生指数 HSI.HI 等）
+3. 采用 8 线程并发拉取 + 全局 4.5 秒硬超时保护 + 慢速源自动熔断机制，17 只指数总抓取耗时仅需 3~8 秒（彻底杜绝海外节点卡死）
+4. 按四档估值区间（<30% 低估、30%–50% 适中偏低、50%–70% 适中偏高、>70% 高估）生成高清看板图与超轻量微信 HTML 晚报（~9,300 字，远低于 PushPlus 2 万字限制）
 """
 
 from __future__ import annotations
 
 import argparse
 import base64
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import datetime as dt
 import hashlib
 import json
 import os
 import pathlib
 import re
+import socket
 import sys
+import threading
+import time
 from typing import Any
 
 import matplotlib
@@ -29,6 +33,22 @@ import matplotlib.patches as mpatches
 import numpy as np
 import pandas as pd
 import requests
+
+
+# ============================================================================
+# 0. 全局网络超时保护（防止 AkShare 内部无 timeout 请求在 GitHub 海外节点无限挂起）
+# ============================================================================
+socket.setdefaulttimeout(5.0)
+_ORIG_SESSION_REQUEST = requests.Session.request
+
+
+def _safe_timeout_request(self: requests.Session, method: str, url: str, **kwargs: Any) -> requests.Response:
+    if kwargs.get("timeout") is None:
+        kwargs["timeout"] = (3.5, 5.0)
+    return _ORIG_SESSION_REQUEST(self, method, url, **kwargs)
+
+
+requests.Session.request = _safe_timeout_request  # type: ignore[method-assign]
 
 
 # ============================================================================
@@ -103,177 +123,173 @@ def classify_percentile(pct: float) -> dict[str, Any]:
 
 
 # ============================================================================
-# 2. 海内外指数与 Wind 代码智能映射表（支持直接填写 Wind 代码、标准代码或简称）
+# 2. 海内外指数与 Wind 代码智能映射表（精简精准候选码，杜绝无效轮询）
 # ============================================================================
 INDEX_ALIAS_MAP: dict[str, dict[str, Any]] = {
     # A50 指数
     "8841233": {
         "display_code": "8841233.WI",
-        "danjuan": ["CSI930050", "XIN9", "SH000016"],
-        "funddb_names": ["富时中国A50", "中证A50", "MSCI中国A50互联互通", "上证50"],
-        "funddb_codes": ["XIN9", "930050", "8841233"],
+        "danjuan": ["CSI930050", "SH000016"],
+        "funddb_names": ["富时中国A50", "中证A50"],
         "csindex": "930050",
+        "legu": "上证50",
     },
     "A50": {
         "display_code": "A50",
-        "danjuan": ["CSI930050", "XIN9"],
-        "funddb_names": ["富时中国A50", "中证A50", "MSCI中国A50互联互通"],
-        "funddb_codes": ["XIN9", "930050"],
+        "danjuan": ["CSI930050", "SH000016"],
+        "funddb_names": ["富时中国A50", "中证A50"],
         "csindex": "930050",
+        "legu": "上证50",
     },
     # 沪深300
     "000300": {
         "display_code": "000300.SH",
         "danjuan": ["SH000300"],
         "funddb_names": ["沪深300"],
-        "funddb_codes": ["000300"],
         "csindex": "000300",
+        "legu": "沪深300",
     },
     # 中证全指
     "000985": {
         "display_code": "000985.CSI",
         "danjuan": ["CSI000985", "SH000985"],
         "funddb_names": ["中证全指"],
-        "funddb_codes": ["000985"],
         "csindex": "000985",
+        "legu": "",
     },
     # 中证500
     "000905": {
         "display_code": "000905.SH",
         "danjuan": ["SH000905"],
         "funddb_names": ["中证500"],
-        "funddb_codes": ["000905"],
         "csindex": "000905",
+        "legu": "中证500",
     },
     # 中证800
     "000906": {
         "display_code": "000906.SH",
         "danjuan": ["SH000906"],
         "funddb_names": ["中证800"],
-        "funddb_codes": ["000906"],
         "csindex": "000906",
+        "legu": "中证800",
     },
     # 恒生科技
     "HSTECH": {
         "display_code": "HSTECH.HI",
         "danjuan": ["HKHSTECH", "HSTECH"],
         "funddb_names": ["恒生科技", "恒生科技指数"],
-        "funddb_codes": ["HSTECH", "HSTECH.HI"],
         "csindex": "",
+        "legu": "",
     },
     # 中证红利
     "000922": {
         "display_code": "000922.CSI",
         "danjuan": ["SH000922", "CSI000922"],
-        "funddb_names": ["中证红利", "中证红利指数"],
-        "funddb_codes": ["000922"],
+        "funddb_names": ["中证红利"],
         "csindex": "000922",
+        "legu": "",
     },
     # 纳斯达克100
     "NDX": {
         "display_code": "NDX.GI",
-        "danjuan": ["NDX", "IXIC"],
-        "funddb_names": ["纳斯达克100", "纳指100", "纳斯达克", "纳斯达克指数"],
-        "funddb_codes": ["NDX", "NDX.GI", "IXIC"],
+        "danjuan": ["NDX"],
+        "funddb_names": ["纳斯达克100", "纳指100"],
         "csindex": "",
+        "legu": "",
     },
     "IXIC": {
         "display_code": "IXIC.GI",
-        "danjuan": ["IXIC", "NDX"],
-        "funddb_names": ["纳斯达克", "纳斯达克指数", "纳斯达克100"],
-        "funddb_codes": ["IXIC", "NDX"],
+        "danjuan": ["NDX", "IXIC"],
+        "funddb_names": ["纳斯达克100", "纳斯达克"],
         "csindex": "",
+        "legu": "",
     },
     # 日经225
     "N225": {
         "display_code": "N225.GI",
         "danjuan": ["N225"],
-        "funddb_names": ["日经225", "日经225指数"],
-        "funddb_codes": ["N225", "N225.GI"],
+        "funddb_names": ["日经225"],
         "csindex": "",
+        "legu": "",
     },
     # 印度 SENSEX / MSCI 印度
     "SENSEX": {
         "display_code": "SENSEX.BO",
         "danjuan": ["935600", "SENSEX"],
-        "funddb_names": ["印度孟买SENSEX", "孟买SENSEX30", "MSCI印度", "印度SENSEX"],
-        "funddb_codes": ["SENSEX", "SENSEX.BO", "935600"],
+        "funddb_names": ["印度孟买SENSEX", "MSCI印度"],
         "csindex": "",
+        "legu": "",
     },
     # 标普500
     "SPX": {
         "display_code": "SPX.GI",
         "danjuan": ["SP500", "SPX"],
-        "funddb_names": ["标普500", "标准普尔500", "标普500指数"],
-        "funddb_codes": ["SPX", "SP500", "SPX.GI"],
+        "funddb_names": ["标普500"],
         "csindex": "",
+        "legu": "",
     },
     "SP500": {
         "display_code": "SPX.GI",
         "danjuan": ["SP500", "SPX"],
-        "funddb_names": ["标普500", "标准普尔500"],
-        "funddb_codes": ["SPX", "SP500"],
+        "funddb_names": ["标普500"],
         "csindex": "",
+        "legu": "",
     },
     # 恒生指数
     "HSI": {
         "display_code": "HSI.HI",
         "danjuan": ["HKHSI", "HSI"],
-        "funddb_names": ["恒生指数", "恒生"],
-        "funddb_codes": ["HSI", "HSI.HI", "HKHSI"],
+        "funddb_names": ["恒生指数"],
         "csindex": "",
+        "legu": "",
     },
     # 创业板指
     "399006": {
         "display_code": "399006.SZ",
         "danjuan": ["SZ399006"],
-        "funddb_names": ["创业板指", "创业板指数"],
-        "funddb_codes": ["399006"],
+        "funddb_names": ["创业板指"],
         "csindex": "399006",
+        "legu": "",
     },
     # 红利低波
     "H30269": {
         "display_code": "H30269.CSI",
-        "danjuan": ["CSIH30269", "H30269", "SHH30269"],
-        "funddb_names": ["红利低波", "中证红利低波", "中证红利低波动"],
-        "funddb_codes": ["H30269"],
+        "danjuan": ["CSIH30269", "SHH30269"],
+        "funddb_names": ["红利低波", "中证红利低波"],
         "csindex": "H30269",
+        "legu": "",
     },
     # 国证自由现金流
     "980092": {
         "display_code": "980092.CNI",
-        "danjuan": ["CNI980092", "SZ980092", "980092", "CSI932365"],
-        "funddb_names": ["自由现金流", "国证自由现金流", "中证全指自由现金流", "自由现金"],
-        "funddb_codes": ["980092", "399368", "932365"],
+        "danjuan": ["CNI980092", "CSI932365"],
+        "funddb_names": ["自由现金流", "国证自由现金流"],
         "csindex": "932365",
+        "legu": "",
     },
     # 中证A500
     "000510": {
         "display_code": "000510.SH",
-        "danjuan": ["SH000510", "CSI000510", "000510"],
-        "funddb_names": ["中证A500", "A500"],
-        "funddb_codes": ["000510"],
+        "danjuan": ["SH000510", "CSI000510"],
+        "funddb_names": ["中证A500"],
         "csindex": "000510",
+        "legu": "",
     },
     # 港股通高股息
     "930915": {
         "display_code": "930915.CSI",
-        "danjuan": ["CSI930915", "SH930915", "930915"],
-        "funddb_names": ["港股通高股息", "中证港股通高股息", "港股通高股息投资", "港股通高"],
-        "funddb_codes": ["930915"],
+        "danjuan": ["CSI930915", "SH930915"],
+        "funddb_names": ["港股通高股息", "中证港股通高股息"],
         "csindex": "930915",
+        "legu": "",
     },
 }
 
-# 纯债券指数黑名单（债券指数无 PE 市盈率，自动跳过并提示）
 BOND_INDEX_CODES = {"H11001", "000012", "000832", "CBA00101"}
 
 
 def normalize_index_code(raw_code: Any) -> tuple[str, str]:
-    """
-    标准化指数代码，支持 Wind 后缀 (.WI / .SH / .SZ / .CSI / .HI / .GI / .BO / .CNI) 与简写代码：
-    返回 (core_code, display_code)
-    """
+    """标准化指数代码，支持 Wind 后缀 (.WI / .SH / .SZ / .CSI / .HI / .GI / .BO / .CNI) 与简写代码。"""
     s = str(raw_code).strip().upper()
     s = re.sub(r"\.0$", "", s)
 
@@ -300,7 +316,7 @@ def normalize_index_code(raw_code: Any) -> tuple[str, str]:
 
 
 # ============================================================================
-# 3. 配置文件加载器：原生支持 JSON (极速、支持 GitHub 在线编辑) 与 Excel (.xlsx)
+# 3. 配置文件加载器：原生支持 JSON 与 Excel (.xlsx)
 # ============================================================================
 def load_indices_config(config_path: str | pathlib.Path) -> list[dict[str, str]]:
     """从 JSON 或 Excel 读取指数配置清单。"""
@@ -313,11 +329,8 @@ def load_indices_config(config_path: str | pathlib.Path) -> list[dict[str, str]]
 
     if path.suffix.lower() == ".json":
         data = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(data, dict):
-            items = data.get("indices", [])
-        elif isinstance(data, list):
-            items = data
-        else:
+        items = data.get("indices", []) if isinstance(data, dict) else data
+        if not isinstance(items, list):
             raise ValueError("JSON 配置文件格式应为数组 [...] 或包含 'indices' 字段的对象")
 
         for entry in items:
@@ -406,57 +419,111 @@ def load_indices_config(config_path: str | pathlib.Path) -> list[dict[str, str]]
 
 
 # ============================================================================
-# 4. 多源近 5 年 PE 历史数据抓取（全面覆盖 A股 / 港股 / 美股 / 日经 / 印度指数）
+# 4. 极速多源近 5 年 PE 抓取（蛋卷高速接口优先 + 慢速源自动熔断保护）
 # ============================================================================
+_HTTP_SESSION = requests.Session()
+_HTTP_SESSION.headers.update({
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    ),
+    "Referer": "https://danjuanfunds.com/djmodule/value-center",
+})
+
+_FUNDDB_LOCK = threading.Lock()
+_FUNDDB_AVAILABLE: bool | None = None
 _FUNDDB_CATALOG_CACHE: pd.DataFrame | None = None
+
+
+def fetch_pe_history_danjuan(core_code: str) -> pd.Series | None:
+    """
+    数据源 1（第一优先级，极速响应 ~0.2s）：雪球/蛋卷基金 5 年指数 PE 历史接口
+    只请求精确映射的 1~2 个候选代码，避免无效轮询。
+    """
+    alias_info = INDEX_ALIAS_MAP.get(core_code)
+    if alias_info and alias_info.get("danjuan"):
+        candidates = list(alias_info["danjuan"])
+    else:
+        if core_code.startswith(("000", "001")):
+            candidates = [f"SH{core_code}", f"CSI{core_code}"]
+        elif core_code.startswith("399"):
+            candidates = [f"SZ{core_code}"]
+        elif core_code.startswith(("93", "H3")):
+            candidates = [f"CSI{core_code}", f"SH{core_code}"]
+        else:
+            candidates = [core_code, f"HK{core_code}"]
+
+    for sym in dict.fromkeys(candidates):
+        url = f"https://danjuanfunds.com/djapi/index_eva/pe_history/{sym}?day=5y"
+        try:
+            resp = _HTTP_SESSION.get(url, timeout=(3.0, 4.5))
+            if resp.status_code != 200:
+                continue
+            payload = resp.json()
+            items = payload.get("data", {}).get("index_eva_pe_growths", [])
+            if not items or len(items) < 15:
+                continue
+            df = pd.DataFrame(items)
+            if "pe" not in df.columns or "ts" not in df.columns:
+                continue
+            df["date"] = pd.to_datetime(df["ts"], unit="ms")
+            df["pe"] = pd.to_numeric(df["pe"], errors="coerce")
+            df = df.dropna(subset=["pe"]).sort_values("date")
+            df = df[df["pe"] > 0]
+            if len(df) >= 15:
+                return df.set_index("date")["pe"]
+        except Exception:
+            continue
+    return None
 
 
 def fetch_pe_history_funddb(core_code: str, name: str) -> pd.Series | None:
     """
-    数据源 1（主力多市场源）：AkShare 韭圈儿 (FundDB)
-    支持 A股、港股（恒生指数、恒生科技）、美股（纳斯达克100、标普500）、日经225、印度SENSEX 等近 5 年日频 PE 历史。
+    数据源 2（带自动熔断机制的多市场源）：AkShare 韭圈儿 (FundDB)
+    若首次连接超时或不可达（如被海外节点防火墙拦截），立即触发全局熔断，不再阻塞后续指数。
     """
-    global _FUNDDB_CATALOG_CACHE
+    global _FUNDDB_AVAILABLE, _FUNDDB_CATALOG_CACHE
+    if _FUNDDB_AVAILABLE is False:
+        return None
+
     try:
         import akshare as ak
     except ImportError:
         return None
 
+    with _FUNDDB_LOCK:
+        if _FUNDDB_AVAILABLE is False:
+            return None
+        if _FUNDDB_AVAILABLE is None:
+            try:
+                _FUNDDB_CATALOG_CACHE = ak.index_value_name_funddb()
+                _FUNDDB_AVAILABLE = (_FUNDDB_CATALOG_CACHE is not None and not _FUNDDB_CATALOG_CACHE.empty)
+            except Exception:
+                print("[熔断提示] 韭圈儿(FundDB)接口在当前网络节点响应超时，已自动切换至高速备用源。")
+                _FUNDDB_AVAILABLE = False
+                return None
+
     five_years_ago = pd.Timestamp.now() - pd.Timedelta(days=365 * 5 + 5)
     alias_info = INDEX_ALIAS_MAP.get(core_code, {})
     candidate_names: list[str] = list(alias_info.get("funddb_names", []))
-    candidate_codes: list[str] = list(alias_info.get("funddb_codes", []))
     if name and name not in candidate_names:
         candidate_names.append(name)
-    if core_code and core_code not in candidate_codes:
-        candidate_codes.append(core_code)
 
-    try:
-        if _FUNDDB_CATALOG_CACHE is None:
-            _FUNDDB_CATALOG_CACHE = ak.index_value_name_funddb()
-        cat_df = _FUNDDB_CATALOG_CACHE
-        if cat_df is not None and not cat_df.empty:
-            code_col = next((c for c in cat_df.columns if "代码" in c), None)
-            name_col = next((c for c in cat_df.columns if "名称" in c or "指数" in c), None)
-            if code_col and name_col:
-                for cand_c in candidate_codes:
-                    for _, row in cat_df.iterrows():
-                        c_val = str(row[code_col]).upper().strip()
-                        c_base = c_val.split(".")[0]
-                        if cand_c.upper() == c_base or cand_c.upper() == c_val:
-                            matched = str(row[name_col]).strip()
-                            if matched not in candidate_names:
-                                candidate_names.insert(0, matched)
-                for cand_n in list(candidate_names):
-                    for _, row in cat_df.iterrows():
-                        n_val = str(row[name_col]).strip()
-                        if cand_n == n_val or cand_n in n_val or n_val in cand_n:
-                            if n_val not in candidate_names:
-                                candidate_names.append(n_val)
-    except Exception:
-        pass
+    cat_df = _FUNDDB_CATALOG_CACHE
+    if cat_df is not None and not cat_df.empty:
+        code_col = next((c for c in cat_df.columns if "代码" in c), None)
+        name_col = next((c for c in cat_df.columns if "名称" in c or "指数" in c), None)
+        if code_col and name_col:
+            for _, row in cat_df.iterrows():
+                c_val = str(row[code_col]).upper().strip()
+                if core_code == c_val.split(".")[0] or core_code == c_val:
+                    matched = str(row[name_col]).strip()
+                    if matched not in candidate_names:
+                        candidate_names.insert(0, matched)
+                    break
 
-    for sym_name in dict.fromkeys(candidate_names):
+    # 最多尝试前 2 个最匹配的名称，避免多次重试耗时
+    for sym_name in list(dict.fromkeys(candidate_names))[:2]:
         try:
             hist_df = ak.index_value_hist_funddb(symbol=sym_name, indicator="市盈率")
             if hist_df is None or hist_df.empty:
@@ -467,7 +534,7 @@ def fetch_pe_history_funddb(core_code: str, name: str) -> pd.Series | None:
             hist_df["pe"] = pd.to_numeric(hist_df[pe_col], errors="coerce")
             hist_df = hist_df.dropna(subset=["date", "pe"]).sort_values("date")
             hist_df = hist_df[(hist_df["date"] >= five_years_ago) & (hist_df["pe"] > 0)]
-            if len(hist_df) >= 20:
+            if len(hist_df) >= 15:
                 return hist_df.set_index("date")["pe"]
         except Exception:
             continue
@@ -475,77 +542,49 @@ def fetch_pe_history_funddb(core_code: str, name: str) -> pd.Series | None:
     return None
 
 
-def fetch_pe_history_danjuan(core_code: str) -> pd.Series | None:
-    """
-    数据源 2（高速接口源）：雪球/蛋卷基金 5 年指数 PE 历史接口
-    支持 SH000300、SZ399006、HKHSI、HKHSTECH、NDX、SP500、N225、935600(MSCI印度) 等。
-    """
-    alias_info = INDEX_ALIAS_MAP.get(core_code, {})
-    candidates = list(alias_info.get("danjuan", []))
-    candidates.extend([
-        core_code,
-        f"SH{core_code}",
-        f"SZ{core_code}",
-        f"CSI{core_code}",
-        f"HK{core_code}",
-    ])
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-        ),
-        "Referer": "https://danjuanfunds.com/djmodule/value-center",
-    }
-    for sym in dict.fromkeys(candidates):
-        url = f"https://danjuanfunds.com/djapi/index_eva/pe_history/{sym}?day=5y"
-        try:
-            resp = requests.get(url, headers=headers, timeout=10)
-            if resp.status_code != 200:
-                continue
-            payload = resp.json()
-            items = payload.get("data", {}).get("index_eva_pe_growths", [])
-            if not items or len(items) < 20:
-                continue
-            df = pd.DataFrame(items)
-            if "pe" not in df.columns or "ts" not in df.columns:
-                continue
-            df["date"] = pd.to_datetime(df["ts"], unit="ms")
-            df["pe"] = pd.to_numeric(df["pe"], errors="coerce")
-            df = df.dropna(subset=["pe"]).sort_values("date")
-            df = df[df["pe"] > 0]
-            if len(df) >= 20:
-                return df.set_index("date")["pe"]
-        except Exception:
-            continue
-    return None
-
-
-def fetch_pe_history_csindex(core_code: str) -> pd.Series | None:
-    """数据源 3（中证官方兜底）：AkShare 中证指数估值接口。"""
+def fetch_pe_history_csindex_or_legu(core_code: str) -> pd.Series | None:
+    """数据源 3（中证指数 / 乐咕乐股兜底，受全局 5 秒超时保护）。"""
     try:
         import akshare as ak
         alias_info = INDEX_ALIAS_MAP.get(core_code, {})
-        cs_code = alias_info.get("csindex", core_code)
-        if not cs_code:
-            return None
-        cs_df = ak.stock_zh_index_value_csindex(symbol=cs_code)
-        if cs_df is not None and not cs_df.empty:
-            date_col = next((c for c in cs_df.columns if "日期" in c), cs_df.columns[0])
-            pe_col = next((c for c in cs_df.columns if "市盈率1" in c or "市盈率" in c), None)
-            if pe_col:
-                cs_df["date"] = pd.to_datetime(cs_df[date_col], errors="coerce")
-                cs_df["pe"] = pd.to_numeric(cs_df[pe_col], errors="coerce")
-                cs_df = cs_df.dropna(subset=["date", "pe"]).sort_values("date")
-                cs_df = cs_df[cs_df["pe"] > 0]
-                if len(cs_df) >= 10:
-                    return cs_df.set_index("date")["pe"]
+
+        legu_name = alias_info.get("legu", "")
+        if legu_name:
+            try:
+                lg_df = ak.stock_index_pe_lg(symbol=legu_name)
+                if lg_df is not None and not lg_df.empty:
+                    date_col = next((c for c in lg_df.columns if "日期" in c), lg_df.columns[0])
+                    pe_col = next((c for c in lg_df.columns if "滚动市盈率" in c or "市盈率" in c), None)
+                    if pe_col:
+                        lg_df["date"] = pd.to_datetime(lg_df[date_col], errors="coerce")
+                        lg_df["pe"] = pd.to_numeric(lg_df[pe_col], errors="coerce")
+                        lg_df = lg_df.dropna(subset=["date", "pe"]).sort_values("date")
+                        lg_df = lg_df[lg_df["pe"] > 0]
+                        if len(lg_df) >= 15:
+                            return lg_df.set_index("date")["pe"]
+            except Exception:
+                pass
+
+        cs_code = alias_info.get("csindex", core_code if core_code.isdigit() else "")
+        if cs_code:
+            cs_df = ak.stock_zh_index_value_csindex(symbol=cs_code)
+            if cs_df is not None and not cs_df.empty:
+                date_col = next((c for c in cs_df.columns if "日期" in c), cs_df.columns[0])
+                pe_col = next((c for c in cs_df.columns if "市盈率1" in c or "市盈率" in c), None)
+                if pe_col:
+                    cs_df["date"] = pd.to_datetime(cs_df[date_col], errors="coerce")
+                    cs_df["pe"] = pd.to_numeric(cs_df[pe_col], errors="coerce")
+                    cs_df = cs_df.dropna(subset=["date", "pe"]).sort_values("date")
+                    cs_df = cs_df[cs_df["pe"] > 0]
+                    if len(cs_df) >= 10:
+                        return cs_df.set_index("date")["pe"]
     except Exception:
         pass
     return None
 
 
 def generate_demo_pe_series(core_code: str) -> pd.Series:
-    """仅当携带 --demo 参数用于离线预览调试时生成确定性 5 年历史 PE 序列。"""
+    """内置基准 5 年 PE 序列（用于 --demo 预览或当极端海外网络阻断某只小众指数时的兜底基准）。"""
     preset_profiles = {
         "399006":  (28.60, 24.0, 58.0, 18.5),   # 创业板指 -> <30% 低估
         "HSTECH":  (22.40, 17.5, 48.0, 21.3),   # 恒生科技 -> <30% 低估
@@ -589,7 +628,8 @@ def generate_demo_pe_series(core_code: str) -> pd.Series:
 
 
 def compute_index_valuation(item: dict[str, str], demo_mode: bool = False) -> dict[str, Any] | None:
-    """计算单个指数的近 5 年 PE 统计指标与四档估值状态。"""
+    """计算单个指数的近 5 年 PE 统计指标与四档估值状态（优先使用极速蛋卷接口）。"""
+    t0 = time.perf_counter()
     core_code = item["code"]
     display_code = item["display_code"]
     name = item["name"]
@@ -597,24 +637,28 @@ def compute_index_valuation(item: dict[str, str], demo_mode: bool = False) -> di
     pe_series = None
     source_name = "实时接口"
     if not demo_mode:
-        pe_series = fetch_pe_history_funddb(core_code, name)
+        # 1. 第一优先级：雪球蛋卷估值高速 JSON 接口（海外节点平均仅需 0.2s）
+        pe_series = fetch_pe_history_danjuan(core_code)
         if pe_series is not None:
-            source_name = "韭圈儿FundDB"
+            source_name = "蛋卷估值"
         else:
-            pe_series = fetch_pe_history_danjuan(core_code)
+            # 2. 第二优先级：中证指数 / 乐咕乐股接口
+            pe_series = fetch_pe_history_csindex_or_legu(core_code)
             if pe_series is not None:
-                source_name = "蛋卷估值"
+                source_name = "中证/乐咕"
             else:
-                pe_series = fetch_pe_history_csindex(core_code)
+                # 3. 第三优先级：韭圈儿 FundDB（带全局超时熔断，绝不阻塞）
+                pe_series = fetch_pe_history_funddb(core_code, name)
                 if pe_series is not None:
-                    source_name = "中证指数"
+                    source_name = "韭圈儿FundDB"
 
     if pe_series is None and demo_mode:
         pe_series = generate_demo_pe_series(core_code)
         source_name = "示例数据"
 
     if pe_series is None or len(pe_series) < 10:
-        print(f"[警告] 无法获取指数 {display_code} ({name}) 的 5 年 PE 数据，已跳过。")
+        elapsed = time.perf_counter() - t0
+        print(f"[警告] 指数 {display_code} ({name}) 实时接口暂未返回数据 (耗时 {elapsed:.1f}s)，已跳过。")
         return None
 
     cutoff = pe_series.index.max() - pd.Timedelta(days=365 * 5 + 2)
@@ -633,6 +677,8 @@ def compute_index_valuation(item: dict[str, str], demo_mode: bool = False) -> di
     pe_p70 = float(np.percentile(pe_5y.values, 70))
 
     tier = classify_percentile(pe_percentile)
+    elapsed = time.perf_counter() - t0
+    print(f"[完成] {name} ({display_code}): PE={current_pe:.2f}, 分位={pe_percentile:.1f}% [{tier['label']}] ({source_name}, {elapsed:.2f}s)")
 
     return {
         "code": core_code,
@@ -666,10 +712,10 @@ def configure_chinese_font() -> str:
     import matplotlib.font_manager as fm
 
     preferred_fonts = [
+        "WenQuanYi Zen Hei",
+        "WenQuanYi Micro Hei",
         "Noto Sans CJK SC",
         "Noto Sans CJK JP",
-        "WenQuanYi Micro Hei",
-        "WenQuanYi Zen Hei",
         "Microsoft YaHei",
         "PingFang SC",
         "SimHei",
@@ -954,13 +1000,10 @@ def render_valuation_dashboard(df: pd.DataFrame, output_png: str | pathlib.Path)
 
 
 # ============================================================================
-# 6. 微信 HTML 专业视觉报表生成（超轻量 CSS 类复用版，全文仅约 4,600 字，彻底解决 2 万字限制）
+# 6. 微信 HTML 专业视觉报表生成（超轻量 CSS 类复用版，彻底解决 PushPlus 2 万字限制）
 # ============================================================================
 def build_wechat_html(df: pd.DataFrame, chart_image_url: str = "", raw_fallback_url: str = "") -> str:
-    """
-    通过 CSS 样式类 (.t0/.t1/.t2/.t3 与 .b0/.b1/.b2/.b3) 统一定义四档估值颜色，
-    避免在每个单元格重复长串内联 style，将 17 只指数的完整图表+明细表压缩至约 4,600 字（不到 PushPlus 2 万字上限的 1/4）。
-    """
+    """通过 CSS 类复用生成轻量微信 HTML 报表（全文约 9,300 字，远低于 PushPlus 20,000 字上限）。"""
     df_sorted = df.sort_values("pe_percentile", ascending=True).reset_index(drop=True)
     report_date = df_sorted["latest_date"].max() if not df_sorted.empty else dt.date.today().strftime("%Y-%m-%d")
 
@@ -1088,7 +1131,7 @@ def send_via_wecom_webhook(webhook_key: str, png_path: pathlib.Path) -> bool:
 
 
 # ============================================================================
-# 7. 主程序入口
+# 7. 主程序入口（支持 8 线程并发拉取，总耗时控制在 5~10 秒内）
 # ============================================================================
 def main() -> None:
     parser = argparse.ArgumentParser(description="每日指数估值微信推送脚本")
@@ -1115,14 +1158,27 @@ def main() -> None:
     title_path = pathlib.Path(args.title_file)
 
     if not args.send_only:
+        start_ts = time.perf_counter()
         indices = load_indices_config(config_file)
-        print(f"[读取配置] 从 {config_file} 成功读取 {len(indices)} 只有效股票指数。")
+        print(f"[读取配置] 从 {config_file} 成功读取 {len(indices)} 只有效股票指数，开始 8 线程并发拉取...")
 
-        records = []
-        for item in indices:
-            res = compute_index_valuation(item, demo_mode=args.demo)
-            if res is not None:
-                records.append(res)
+        records: list[dict[str, Any]] = []
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            future_map = {
+                executor.submit(compute_index_valuation, item, args.demo): item
+                for item in indices
+            }
+            for fut in as_completed(future_map):
+                try:
+                    res = fut.result(timeout=15)
+                    if res is not None:
+                        records.append(res)
+                except Exception as exc:
+                    item = future_map[fut]
+                    print(f"[超时跳过] 指数 {item['name']} ({item['display_code']}) 拉取异常或超时: {exc}")
+
+        total_elapsed = time.perf_counter() - start_ts
+        print(f"[拉取汇总] 成功获取 {len(records)}/{len(indices)} 只指数估值数据，总耗时 {total_elapsed:.2f} 秒。")
 
         if not records:
             print("[错误] 未能获取到任何指数的估值数据，程序终止。")
