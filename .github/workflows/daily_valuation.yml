@@ -1,9 +1,10 @@
 name: Daily Index Valuation WeChat Push
 
 on:
-  # 每天北京时间下午 16:00 自动执行 (16:00 CST = 08:00 UTC)
+  # 每天北京时间下午 16:05 自动执行 (避开整点 00 分的 GitHub 全球排队拥堵高峰；16:05 CST = 08:05 UTC)
   schedule:
-    - cron: '0 8 * * *'
+    - cron: '5 8 * * *'
+  # 支持在 GitHub 页面手动点击 "Run workflow" 立即测试推送
   workflow_dispatch:
 
 jobs:
@@ -21,7 +22,7 @@ jobs:
           cache: 'pip'
           cache-dependency-path: '.github/workflows/daily_valuation.yml'
 
-      - name: 3. 极速安装轻量依赖库（无需 Matplotlib 与字体包，3秒完成）
+      - name: 3. 极速安装轻量依赖库（3秒完成）
         run: |
           pip install pandas numpy requests openpyxl
 
