@@ -50,10 +50,44 @@
     "note": "纳斯达克100指数 (NDX)"
   },
   {
+    "code": "DJI.GI",
+    "name": "道琼斯",
+    "market": "海外美股",
+    "enabled": true,
+    "note": "道琼斯工业平均指数 (DJI)"
+  },
+  {
+    "code": "SPX.GI",
+    "name": "标普500",
+    "market": "海外美股",
+    "enabled": true
+  },
+  {
     "code": "N225.GI",
     "name": "日经225",
     "market": "海外亚太",
     "enabled": true
+  },
+  {
+    "code": "TOPX.GI",
+    "name": "日本东证",
+    "market": "海外亚太",
+    "enabled": true,
+    "note": "日本东证股价指数 (TOPIX)"
+  },
+  {
+    "code": "FCHI.GI",
+    "name": "法国CAC40",
+    "market": "海外欧洲",
+    "enabled": true,
+    "note": "法国巴黎CAC40指数 (FCHI)"
+  },
+  {
+    "code": "GDAXI.GI",
+    "name": "德国DAX",
+    "market": "海外欧洲",
+    "enabled": true,
+    "note": "德国法兰克福DAX指数 (GDAXI)"
   },
   {
     "code": "SENSEX.BO",
@@ -61,12 +95,6 @@
     "market": "海外亚太",
     "enabled": true,
     "note": "孟买SENSEX30 / MSCI印度 (935600)"
-  },
-  {
-    "code": "SPX.GI",
-    "name": "标普500",
-    "market": "海外美股",
-    "enabled": true
   },
   {
     "code": "HSI.HI",
