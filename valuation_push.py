@@ -20,7 +20,6 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import datetime as dt
-import hashlib
 import json
 import os
 import pathlib
@@ -107,10 +106,7 @@ def classify_percentile(pct: float) -> dict[str, Any]:
 
 
 def get_dca_action(composite_pct: float, pe_pct: float, pb_pct: float, div_yield: float, is_dividend_idx: bool) -> str:
-    """
-    结合 PE百分位 + PB百分位 + 股息率 给出专业定投倍率建议：
-    - 若为红利策略指数且股息率 >= 5.0%，在低估/适中偏低区额外强化定投信号
-    """
+    """结合 PE百分位 + PB百分位 + 股息率 给出专业定投倍率建议。"""
     if composite_pct < 18.0 or (pe_pct < 25.0 and pb_pct < 25.0):
         return "🔥 2.0x 双倍定投"
     elif composite_pct < 30.0:
@@ -128,7 +124,7 @@ def get_dca_action(composite_pct: float, pe_pct: float, pb_pct: float, div_yield
 
 
 # ============================================================================
-# 2. 海内外指数与 Wind 代码智能映射表（含指数类型：broad=宽基, dividend=红利现金流, overseas=海外/科技）
+# 2. 海内外指数与 Wind 代码智能映射表（含道琼斯 DJI、法国 FCHI、德国 GDAXI、日本东证 TOPX）
 # ============================================================================
 INDEX_ALIAS_MAP: dict[str, dict[str, Any]] = {
     "8841233": {"display_code": "8841233.WI", "danjuan": ["CSI930050", "SH000016"], "style": "broad"},
@@ -141,10 +137,17 @@ INDEX_ALIAS_MAP: dict[str, dict[str, Any]] = {
     "000922":  {"display_code": "000922.CSI", "danjuan": ["SH000922", "CSI000922"], "style": "dividend"},
     "NDX":     {"display_code": "NDX.GI",     "danjuan": ["NDX"],                   "style": "overseas"},
     "IXIC":    {"display_code": "IXIC.GI",    "danjuan": ["NDX", "IXIC"],           "style": "overseas"},
-    "N225":    {"display_code": "N225.GI",    "danjuan": ["N225"],                  "style": "overseas"},
-    "SENSEX":  {"display_code": "SENSEX.BO",  "danjuan": ["935600", "SENSEX"],      "style": "overseas"},
+    "DJI":     {"display_code": "DJI.GI",     "danjuan": ["DJI"],                   "style": "overseas"},
     "SPX":     {"display_code": "SPX.GI",     "danjuan": ["SP500", "SPX"],          "style": "overseas"},
     "SP500":   {"display_code": "SPX.GI",     "danjuan": ["SP500", "SPX"],          "style": "overseas"},
+    "N225":    {"display_code": "N225.GI",    "danjuan": ["N225"],                  "style": "overseas"},
+    "TOPX":    {"display_code": "TOPX.GI",    "danjuan": ["TOPX", "TOPIX"],         "style": "overseas"},
+    "TOPIX":   {"display_code": "TOPX.GI",    "danjuan": ["TOPX", "TOPIX"],         "style": "overseas"},
+    "FCHI":    {"display_code": "FCHI.GI",    "danjuan": ["FCHI", "CAC40"],         "style": "overseas"},
+    "CAC40":   {"display_code": "FCHI.GI",    "danjuan": ["FCHI", "CAC40"],         "style": "overseas"},
+    "GDAXI":   {"display_code": "GDAXI.GI",   "danjuan": ["GDAXI", "DAX"],          "style": "overseas"},
+    "DAX":     {"display_code": "GDAXI.GI",   "danjuan": ["GDAXI", "DAX"],          "style": "overseas"},
+    "SENSEX":  {"display_code": "SENSEX.BO",  "danjuan": ["935600", "SENSEX"],      "style": "overseas"},
     "HSI":     {"display_code": "HSI.HI",     "danjuan": ["HKHSI", "HSI"],          "style": "overseas"},
     "399006":  {"display_code": "399006.SZ",  "danjuan": ["SZ399006"],              "style": "broad"},
     "H30269":  {"display_code": "H30269.CSI", "danjuan": ["CSIH30269", "SHH30269"], "style": "dividend"},
@@ -154,6 +157,7 @@ INDEX_ALIAS_MAP: dict[str, dict[str, Any]] = {
 }
 
 BOND_INDEX_CODES = {"H11001", "000012", "000832", "CBA00101"}
+OVERSEAS_CODES = {"NDX", "IXIC", "DJI", "SPX", "SP500", "N225", "TOPX", "TOPIX", "FCHI", "CAC40", "GDAXI", "DAX", "SENSEX"}
 
 
 def normalize_index_code(raw_code: Any) -> tuple[str, str]:
@@ -299,10 +303,7 @@ _HTTP_SESSION.headers.update({
 
 
 def fetch_danjuan_batch_snapshot() -> dict[str, dict[str, Any]]:
-    """
-    优化点 1：通过 1 次 HTTP 请求批量拉取雪球蛋卷估值中心全量快照 (`/djapi/index_eva/dj`)，
-    耗时仅 0.2s 即可一次获取所有主流指数的实时 PE、PB、股息率 (yeild)、ROE 等多维指标！
-    """
+    """通过 1 次 HTTP 请求批量拉取雪球蛋卷估值中心全量快照 (`/djapi/index_eva/dj`)。"""
     url = "https://danjuanfunds.com/djapi/index_eva/dj"
     snapshot_map: dict[str, dict[str, Any]] = {}
     try:
@@ -320,9 +321,7 @@ def fetch_danjuan_batch_snapshot() -> dict[str, dict[str, Any]]:
 
 
 def fetch_danjuan_5y_series(candidates: list[str], metric: str = "pe") -> pd.Series | None:
-    """
-    拉取单个指数的近 5 年日频 PE (`pe_history`) 或 PB (`pb_history`) 序列。
-    """
+    """拉取单个指数的近 5 年日频 PE (`pe_history`) 或 PB (`pb_history`) 序列。"""
     endpoint = "pe_history" if metric == "pe" else "pb_history"
     list_key = "index_eva_pe_growths" if metric == "pe" else "index_eva_pb_growths"
     val_key = "pe" if metric == "pe" else "pb"
@@ -363,10 +362,17 @@ REFERENCE_MULTI_PROFILES: dict[str, tuple[float, float, float, float, float, flo
     "000510":  (14.10, 38.9, 11.8, 14.9, 18.5, 1.46, 35.5, 2.76, 10.4),  # 中证A500
     "000922":  ( 7.15, 41.2,  5.8,  7.3,  8.6, 0.78, 38.0, 5.65, 10.9),  # 中证红利
     "8841233": (10.35, 44.5,  8.6, 10.7, 13.4, 1.18, 41.0, 3.85, 11.4),  # A50指数
+    "FCHI":    (14.60, 48.5, 11.8, 14.8, 18.2, 1.88, 52.0, 3.10, 12.9),  # 法国CAC40
+    "CAC40":   (14.60, 48.5, 11.8, 14.8, 18.2, 1.88, 52.0, 3.10, 12.9),  # 法国CAC40
     "980092":  (13.80, 53.7, 10.5, 13.6, 16.9, 1.85, 49.0, 4.35, 13.4),  # 自由现金流
+    "GDAXI":   (15.20, 55.4, 11.5, 14.7, 17.8, 1.65, 58.0, 2.75, 10.8),  # 德国DAX
+    "DAX":     (15.20, 55.4, 11.5, 14.7, 17.8, 1.65, 58.0, 2.75, 10.8),  # 德国DAX
     "H30269":  ( 7.68, 57.9,  5.9,  7.4,  8.8, 0.82, 54.5, 5.18, 10.7),  # 红利低波
+    "TOPX":    (15.80, 61.2, 12.4, 15.1, 18.0, 1.42, 65.0, 2.25,  9.0),  # 日本东证TOPIX
+    "TOPIX":   (15.80, 61.2, 12.4, 15.1, 18.0, 1.42, 65.0, 2.25,  9.0),  # 日本东证TOPIX
     "N225":    (21.60, 63.5, 16.2, 20.5, 24.8, 2.05, 68.0, 1.65,  9.5),  # 日经225
     "SENSEX":  (23.85, 74.2, 18.5, 22.0, 26.2, 3.65, 76.5, 1.20, 15.3),  # 印度SEN
+    "DJI":     (22.80, 76.8, 16.8, 20.4, 24.5, 5.10, 81.0, 1.82, 22.4),  # 道琼斯
     "SPX":     (27.40, 81.5, 19.2, 24.1, 29.5, 4.85, 86.0, 1.32, 17.7),  # 标普500
     "NDX":     (33.90, 84.8, 23.5, 29.7, 36.8, 7.95, 88.5, 0.78, 23.5),  # 纳斯达克
 }
@@ -377,9 +383,7 @@ def compute_index_valuation(
     batch_snapshot: dict[str, dict[str, Any]],
     demo_mode: bool = False,
 ) -> dict[str, Any]:
-    """
-    计算单只指数的 PE + PB + 股息率 + ROE 多维指标及综合定投决策信号。
-    """
+    """计算单只指数的 PE + PB + 股息率 + ROE 多维指标及综合定投决策信号。"""
     core_code = item["code"]
     display_code = item["display_code"]
     name = item["name"]
@@ -400,7 +404,6 @@ def compute_index_valuation(
     else:
         candidates = [core_code, f"HK{core_code}"]
 
-    # 1. 从批量快照提取股息率、ROE、PB 等实时字段
     snap = next((batch_snapshot[c] for c in candidates if c in batch_snapshot), None)
     ref = REFERENCE_MULTI_PROFILES.get(
         core_code,
@@ -446,7 +449,6 @@ def compute_index_valuation(
     else:
         current_pb, pb_percentile = ref[5], ref[6]
 
-    # 提取股息率 (%) 与 ROE (%)
     if snap and snap.get("yeild") is not None:
         raw_y = float(snap.get("yeild") or 0.0)
         div_yield = raw_y * 100.0 if raw_y < 0.5 else raw_y
@@ -459,7 +461,6 @@ def compute_index_valuation(
     else:
         roe_pct = ref[8]
 
-    # 计算「PE + PB 双因子综合估值百分位」：60% PE分位 + 40% PB分位
     composite_pct = round(0.60 * pe_percentile + 0.40 * pb_percentile, 1)
     tier = classify_percentile(pe_percentile)
     dca_action = get_dca_action(
@@ -499,15 +500,10 @@ def compute_index_valuation(
 
 
 # ============================================================================
-# 5. 微信 HTML 专业多维估值与定投晚报生成（无外部大图，秒开且小于 1 万字）
+# 5. 微信 HTML 专业多维估值与定投晚报生成（无外部大图，秒开且小于 1.2 万字）
 # ============================================================================
 def build_wechat_html(df: pd.DataFrame, cn_bond_10y: float = 2.12) -> str:
-    """
-    构建无外部图片依赖、纯微信原生 CSS 渲染的多维估值与定投决策晚报：
-    1. 顶部市场高低位温度计（全市场加权估值温度 + 沪深300股债利差 ERP）
-    2. 四色可视化 5 年 PE 百分位进度条 + 定投倍率标签（🔥2.0x / 🟢1.5x / 🔵1.0x / 🟠0.5x / 🔴暂停）
-    3. 多维交叉印证数据明细表（PE及5年分位 + PB及5年分位 + 股息率/ROE + 定投信号）
-    """
+    """构建无外部图片依赖、纯微信原生 CSS 渲染的多维估值与定投决策晚报。"""
     df_sorted = df.sort_values("pe_percentile", ascending=True).reset_index(drop=True)
     report_date = df_sorted["latest_date"].max() if not df_sorted.empty else dt.date.today().strftime("%Y-%m-%d")
 
@@ -516,12 +512,11 @@ def build_wechat_html(df: pd.DataFrame, cn_bond_10y: float = 2.12) -> str:
     cnt_mid_high = int(((df_sorted["pe_percentile"] >= 50) & (df_sorted["pe_percentile"] <= 70)).sum())
     cnt_high = int((df_sorted["pe_percentile"] > 70).sum())
 
-    # 计算市场整体高低位指标：1) A股+港股核心宽基平均分位温度；2) 沪深300 股债利差 ERP
     hs300_row = df_sorted[df_sorted["code"] == "000300"]
     hs300_pe = float(hs300_row["current_pe"].iloc[0]) if not hs300_row.empty else 12.15
-    erp_val = (100.0 / hs300_pe) - cn_bond_10y  # 盈利收益率(E/P) - 10年期国债收益率
+    erp_val = (100.0 / hs300_pe) - cn_bond_10y
 
-    cn_hk_df = df_sorted[~df_sorted["code"].isin(["NDX", "SPX", "N225", "SENSEX"])]
+    cn_hk_df = df_sorted[~df_sorted["code"].isin(OVERSEAS_CODES)]
     market_temp = float(cn_hk_df["composite_pct"].mean()) if not cn_hk_df.empty else float(df_sorted["composite_pct"].mean())
 
     if market_temp < 30.0:
@@ -639,7 +634,7 @@ def send_via_pushplus(token: str, title: str, html_content: str, topic: str = ""
 
 
 # ============================================================================
-# 6. 主程序入口（无图片依赖，单步极速完成）
+# 6. 主程序入口
 # ============================================================================
 def main() -> None:
     parser = argparse.ArgumentParser(description="每日指数估值与定投决策微信推送脚本")
@@ -650,7 +645,6 @@ def main() -> None:
     parser.add_argument("--demo", action="store_true", help="使用内置演示数据生成报表预览")
     parser.add_argument("--skip-push", action="store_true", help="仅生成 HTML 文件，暂不执行微信推送")
     parser.add_argument("--send-only", action="store_true", help="直接读取已生成的 HTML 执行微信推送")
-    # 兼容旧工作流残留参数
     parser.add_argument("--output-png", default="", help="已废弃参数（保留向下兼容）")
     args = parser.parse_args()
 
