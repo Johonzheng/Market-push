@@ -1,18 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-每日指数估值与定投决策微信推送系统 (多维交叉印证 + 免图片极速版)
-核心升级：
-1. 移除外部 PNG 大图与字体下载，保留并强化微信原生 HTML 四色可视化进度条与彩色数据表（秒开无加载延迟）
-2. 专业多维估值交叉印证体系：
-   - 同时拉取并计算近 5 年 PE（市盈率）百分位 + 近 5 年 PB（市净率）百分位 + 股息率 (Dividend Yield) + ROE (净资产收益率)
-   - 引入「PE + PB 联合估值百分位」（针对红利类指数结合股息率修正），避免单一 PE 在盈利周期底部失真
-3. 顶层「市场整体高低位温度计」：
-   - 自动计算沪深300股债利差 ERP (1/PE - 10年期国债收益率) 与全市场综合估值温度 (0~100°C)，一眼判断大盘高低位
-4. 量化定投倍率信号：
-   - 按综合估值分位自动给出定投操作建议（🔥2.0x加倍 / 🟢1.5x加码 / 🔵1.0x标准 / 🟠0.5x减半 / 🔴暂停止盈）
-5. 数据获取优化：
-   - 先通过雪球蛋卷全量快照接口 (1次请求 0.2s) 批量获取所有指数实时 PE/PB/股息率/ROE，再并发拉取 5 年日频序列精算 5 年分位
+每日指数估值与定投决策微信推送系统 (多维交叉印证 + 自动降级防超限极速版)
+核心特性：
+1. 移除外部 PNG 大图与字体下载，纯微信原生 HTML 四色可视化进度条与多维数据表（秒开无加载延迟）
+2. 专业四维估值交叉印证：近 5 年 PE 分位 + 近 5 年 PB 分位 + 股息率 + ROE + 沪深300股债利差(ERP) + 全市场温度计
+3. 自动防超限雙重保障：主报表压缩至 ~5,800 字；若 PushPlus 返回内容过大 (code=999)，自动切换极简版 (~2,600 字) 重发；若未配置 Token 或发送失败直接报错退出 (exit 1)，杜绝静默失败
 """
 
 from __future__ import annotations
@@ -59,7 +52,7 @@ VALUATION_TIERS = [
         "key": "undervalued",
         "label": "低估",
         "range_text": "<30%",
-        "color": "#10B981",       # 翡翠绿
+        "color": "#10B981",
         "text_color": "#065F46",
         "bg_color": "#D1FAE5",
     },
@@ -68,7 +61,7 @@ VALUATION_TIERS = [
         "key": "normal_low",
         "label": "适中偏低",
         "range_text": "30%–50%",
-        "color": "#3B82F6",       # 晴空蓝
+        "color": "#3B82F6",
         "text_color": "#1E40AF",
         "bg_color": "#DBEAFE",
     },
@@ -77,7 +70,7 @@ VALUATION_TIERS = [
         "key": "normal_high",
         "label": "适中偏高",
         "range_text": "50%–70%",
-        "color": "#F59E0B",       # 琥珀橙
+        "color": "#F59E0B",
         "text_color": "#92400E",
         "bg_color": "#FEF3C7",
     },
@@ -86,7 +79,7 @@ VALUATION_TIERS = [
         "key": "overvalued",
         "label": "高估",
         "range_text": ">70%",
-        "color": "#EF4444",       # 珊瑚红
+        "color": "#EF4444",
         "text_color": "#991B1B",
         "bg_color": "#FEE2E2",
     },
@@ -108,19 +101,19 @@ def classify_percentile(pct: float) -> dict[str, Any]:
 def get_dca_action(composite_pct: float, pe_pct: float, pb_pct: float, div_yield: float, is_dividend_idx: bool) -> str:
     """结合 PE百分位 + PB百分位 + 股息率 给出专业定投倍率建议。"""
     if composite_pct < 18.0 or (pe_pct < 25.0 and pb_pct < 25.0):
-        return "🔥 2.0x 双倍定投"
+        return "🔥2.0x定投"
     elif composite_pct < 30.0:
-        return "🟢 1.5x 加码定投"
+        return "🟢1.5x定投"
     elif composite_pct < 50.0:
         if is_dividend_idx and div_yield >= 4.8:
-            return "🟢 1.2x 红利定投"
-        return "🔵 1.0x 标准定投"
+            return "🟢1.2x定投"
+        return "🔵1.0x定投"
     elif composite_pct <= 70.0:
-        return "🟠 0.5x 减半/持有"
+        return "🟠0.5x减半"
     elif composite_pct <= 85.0:
-        return "🔴 暂停定投"
+        return "🔴暂停定投"
     else:
-        return "🚨 分批止盈"
+        return "🚨分批止盈"
 
 
 # ============================================================================
@@ -290,7 +283,7 @@ def load_indices_config(config_path: str | pathlib.Path) -> list[dict[str, str]]
 
 
 # ============================================================================
-# 4. 多维估值数据获取优化：全量批量快照 (0.2s) + 5年 PE/PB 并发拉取 + 10Y国债ERP计算
+# 4. 多维估值数据获取：全量批量快照 (0.2s) + 5年 PE/PB 并发拉取
 # ============================================================================
 _HTTP_SESSION = requests.Session()
 _HTTP_SESSION.headers.update({
@@ -500,9 +493,9 @@ def compute_index_valuation(
 
 
 # ============================================================================
-# 5. 微信 HTML 专业多维估值与定投晚报生成（无外部大图，秒开且小于 1.2 万字）
+# 5. 微信 HTML 专业多维估值与定投晚报生成（支持标准版与极简防超限版）
 # ============================================================================
-def build_wechat_html(df: pd.DataFrame, cn_bond_10y: float = 2.12) -> str:
+def build_wechat_html(df: pd.DataFrame, cn_bond_10y: float = 2.12, compact_only: bool = False) -> str:
     """构建无外部图片依赖、纯微信原生 CSS 渲染的多维估值与定投决策晚报。"""
     df_sorted = df.sort_values("pe_percentile", ascending=True).reset_index(drop=True)
     report_date = df_sorted["latest_date"].max() if not df_sorted.empty else dt.date.today().strftime("%Y-%m-%d")
@@ -520,13 +513,13 @@ def build_wechat_html(df: pd.DataFrame, cn_bond_10y: float = 2.12) -> str:
     market_temp = float(cn_hk_df["composite_pct"].mean()) if not cn_hk_df.empty else float(df_sorted["composite_pct"].mean())
 
     if market_temp < 30.0:
-        mkt_status = "🟢 历史低位区（高性价比定投击球区）"
+        mkt_status = "🟢历史低位(高性价比击球区)"
     elif market_temp < 50.0:
-        mkt_status = "🔵 中枢偏低区（适合坚持标准定投）"
+        mkt_status = "🔵中枢偏低(适合标准定投)"
     elif market_temp <= 70.0:
-        mkt_status = "🟠 中枢偏高区（控制仓位，精选低估品种）"
+        mkt_status = "🟠中枢偏高(控制仓位精选)"
     else:
-        mkt_status = "🔴 历史高位区（注意风险，分批止盈为主）"
+        mkt_status = "🔴历史高位(分批止盈为主)"
 
     if erp_val >= 5.5:
         erp_desc = "股债性价比极高(股显著优于债)"
@@ -542,52 +535,60 @@ def build_wechat_html(df: pd.DataFrame, cn_bond_10y: float = 2.12) -> str:
     for _, r in df_sorted.iterrows():
         t_idx = int(r["tier_idx"])
         pct = max(2.0, min(100.0, float(r["pe_percentile"])))
-        bar_rows.append(
-            f'<div class="bi"><div class="bh"><b>{r["name"]}<i>({r["display_code"]})</i></b>'
-            f'<s class="bp t{t_idx}">PE {r["current_pe"]:.1f}({r["pe_percentile"]:.0f}%) · {r["dca_action"]}</s></div>'
-            f'<div class="bt"><i class="b{t_idx}" style="width:{pct:.1f}%"></i></div></div>'
-        )
+        if not compact_only:
+            bar_rows.append(
+                f'<div class="bi"><div class="bh"><b>{r["name"]}<i>({r["display_code"]})</i></b>'
+                f'<s class="bp t{t_idx}">PE {r["current_pe"]:.1f}({r["pe_percentile"]:.0f}%) · {r["dca_action"]}</s></div>'
+                f'<div class="bt"><i class="b{t_idx}" style="width:{pct:.1f}%"></i></div></div>'
+            )
         table_rows.append(
             f'<tr><td><b>{r["name"]}</b><br><i>{r["display_code"]}</i></td>'
-            f'<td class="c{t_idx}"><b>{r["current_pe"]:.1f}</b><br><i>{r["pe_percentile"]:.1f}%分位</i></td>'
+            f'<td class="c{t_idx}"><b>{r["current_pe"]:.1f}</b><br><i>{r["pe_percentile"]:.0f}%分位</i></td>'
             f'<td><b>{r["current_pb"]:.2f}</b><br><i>{r["pb_percentile"]:.0f}%分位</i></td>'
-            f'<td><b>{r["div_yield"]:.2f}%</b><br><i>ROE {r["roe"]:.1f}%</i></td>'
+            f'<td><b>{r["div_yield"]:.1f}%</b><br><i>ROE {r["roe"]:.0f}%</i></td>'
             f'<td><s class="tg t{t_idx}">{r["tier_label"]}</s><br><b class="da">{r["dca_action"]}</b></td></tr>'
         )
 
     style_css = (
         "<style>"
-        ".vw{font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif;background:#F1F5F9;padding:10px;color:#0F172A;line-height:1.45}"
-        ".hd{background:linear-gradient(135deg,#0F172A,#1E3A8A);color:#FFF;padding:14px;border-radius:12px;margin-bottom:10px}"
-        ".ht{font-size:16px;font-weight:700;margin-bottom:3px}.hs{font-size:11px;color:#CBD5E1}"
-        ".mb{background:rgba(255,255,255,.1);border-radius:8px;padding:8px 10px;margin-top:10px;font-size:11.5px;color:#F8FAFC}"
-        ".mb div{margin-bottom:3px}.mb div:last-child{margin-bottom:0}"
-        ".kg{display:flex;gap:5px;margin-top:10px;text-align:center}.kc{flex:1;border-radius:8px;padding:5px 2px}"
-        ".kv{font-size:15px;font-weight:700}.kl{font-size:10px}"
-        ".cd{background:#FFF;border-radius:10px;padding:12px;margin-bottom:10px;border:1px solid #E2E8F0}"
-        ".ct{font-size:13.5px;font-weight:700;color:#0F172A;margin-bottom:4px}.cs{font-size:11px;color:#64748B;margin-bottom:10px}"
-        ".bi{margin-bottom:9px}.bh{display:flex;justify-content:space-between;align-items:center;font-size:12px;margin-bottom:3px}"
-        ".bh b i{font-style:normal;font-weight:400;color:#64748B;font-size:10px;margin-left:2px}"
-        "s.bp,s.tg{text-decoration:none;font-weight:700;padding:1px 6px;border-radius:8px;font-size:10px;display:inline-block}"
-        ".bt{height:10px;background:linear-gradient(90deg,#ECFDF5 0,#ECFDF5 29.7%,#94A3B8 30%,#EFF6FF 30.3%,#EFF6FF 49.7%,#94A3B8 50%,#FFFBEB 50.3%,#FFFBEB 69.7%,#94A3B8 70%,#FEF2F2 70.3%,#FEF2F2 100%);border-radius:5px;overflow:hidden;border:1px solid #E2E8F0}"
+        ".vw{font-family:-apple-system,'PingFang SC',sans-serif;background:#F1F5F9;padding:8px;color:#0F172A;line-height:1.4}"
+        ".hd{background:linear-gradient(135deg,#0F172A,#1E3A8A);color:#FFF;padding:12px;border-radius:10px;margin-bottom:8px}"
+        ".ht{font-size:15px;font-weight:700}.hs{font-size:11px;color:#CBD5E1}"
+        ".mb{background:rgba(255,255,255,.1);border-radius:7px;padding:7px 9px;margin-top:8px;font-size:11px;color:#F8FAFC}"
+        ".kg{display:flex;gap:4px;margin-top:8px;text-align:center}.kc{flex:1;border-radius:7px;padding:4px 2px}"
+        ".kv{font-size:14px;font-weight:700}.kl{font-size:9.5px}"
+        ".cd{background:#FFF;border-radius:9px;padding:10px;margin-bottom:8px;border:1px solid #E2E8F0}"
+        ".ct{font-size:13px;font-weight:700;color:#0F172A;margin-bottom:3px}.cs{font-size:10.5px;color:#64748B;margin-bottom:8px}"
+        ".bi{margin-bottom:8px}.bh{display:flex;justify-content:space-between;align-items:center;font-size:11.5px;margin-bottom:2px}"
+        ".bh b i{font-style:normal;font-weight:400;color:#64748B;font-size:9.5px;margin-left:2px}"
+        "s.bp,s.tg{text-decoration:none;font-weight:700;padding:1px 5px;border-radius:6px;font-size:9.5px;display:inline-block}"
+        ".bt{height:9px;background:linear-gradient(90deg,#ECFDF5 0,#ECFDF5 29.7%,#94A3B8 30%,#EFF6FF 30.3%,#EFF6FF 49.7%,#94A3B8 50%,#FFFBEB 50.3%,#FFFBEB 69.7%,#94A3B8 70%,#FEF2F2 70.3%,#FEF2F2 100%);border-radius:5px;overflow:hidden;border:1px solid #E2E8F0}"
         ".bt i{display:block;height:100%;border-radius:5px}"
         ".t0{color:#065F46;background:#D1FAE5}.t1{color:#1E40AF;background:#DBEAFE}.t2{color:#92400E;background:#FEF3C7}.t3{color:#991B1B;background:#FEE2E2}"
         ".b0{background:#10B981}.b1{background:#3B82F6}.b2{background:#F59E0B}.b3{background:#EF4444}"
         ".c0{color:#065F46}.c1{color:#1E40AF}.c2{color:#92400E}.c3{color:#991B1B}"
-        "table.vt{width:100%;border-collapse:collapse;font-size:11px}"
-        ".vt th{background:#1E293B;color:#FFF;padding:6px 3px;font-size:10px;text-align:right}.vt th:first-child{text-align:left}.vt th:last-child{text-align:center}"
-        ".vt td{padding:6px 3px;border-bottom:1px solid #E2E8F0;text-align:right;vertical-align:middle}.vt td:first-child{text-align:left}.vt td:last-child{text-align:center}"
-        ".vt tr:nth-child(even){background:#F8FAFC}.vt td i{font-style:normal;font-size:9.5px;color:#64748B}"
-        ".da{font-size:9.5px;color:#334155}"
+        "table.vt{width:100%;border-collapse:collapse;font-size:10.5px}"
+        ".vt th{background:#1E293B;color:#FFF;padding:5px 2px;font-size:9.5px;text-align:right}.vt th:first-child{text-align:left}.vt th:last-child{text-align:center}"
+        ".vt td{padding:5px 2px;border-bottom:1px solid #E2E8F0;text-align:right;vertical-align:middle}.vt td:first-child{text-align:left}.vt td:last-child{text-align:center}"
+        ".vt tr:nth-child(even){background:#F8FAFC}.vt td i{font-style:normal;font-size:9px;color:#64748B}"
+        ".da{font-size:9px;color:#334155}"
         "</style>"
     )
+
+    bar_section = ""
+    if not compact_only:
+        bar_section = (
+            f'<div class="cd"><div class="ct">🎯 近5年PE历史百分位与定投信号</div>'
+            f'<div class="cs">刻度线：<b class="c0">30%低估</b> / <b class="c1">50%中位</b> / <b class="c3">70%高估</b></div>'
+            f'{"".join(bar_rows)}</div>'
+        )
 
     html = (
         f'{style_css}<div class="vw">'
         f'<div class="hd"><div class="ht">📈 每日指数估值与定投决策晚报</div>'
-        f'<div class="hs">数据日期：{report_date} · 监控 {len(df_sorted)} 只指数 (PE+PB+股息率+ERP四维印证)</div>'
+        f'<div class="hs">数据日期：{report_date} · 监控 {len(df_sorted)} 只指数</div>'
         f'<div class="mb">'
-        f'<div>🧭 <b>A/港股整体温度</b>：<b>{market_temp:.1f}°C</b> — {mkt_status}</div>'
+        f'<div>🧭 <b>A/港股温度</b>：<b>{market_temp:.1f}°C</b> — {mkt_status}</div>'
         f'<div>⚖️ <b>沪深300股债利差(ERP)</b>：<b>{erp_val:.2f}%</b> — {erp_desc}</div>'
         f'</div>'
         f'<div class="kg">'
@@ -596,10 +597,8 @@ def build_wechat_html(df: pd.DataFrame, cn_bond_10y: float = 2.12) -> str:
         f'<div class="kc" style="background:rgba(245,158,11,.2);border:1px solid #F59E0B"><div class="kv" style="color:#FBBF24">{cnt_mid_high}</div><div class="kl" style="color:#FEF3C7">偏高50-70%</div></div>'
         f'<div class="kc" style="background:rgba(239,68,68,.2);border:1px solid #EF4444"><div class="kv" style="color:#F87171">{cnt_high}</div><div class="kl" style="color:#FEE2E2">高估&gt;70%</div></div>'
         f'</div></div>'
-        f'<div class="cd"><div class="ct">🎯 近5年PE历史百分位与定投信号</div>'
-        f'<div class="cs">刻度线依次为 <b class="c0">30%低估线</b> / <b class="c1">50%中位线</b> / <b class="c3">70%高估线</b></div>'
-        f'{"".join(bar_rows)}</div>'
-        f'<div class="cd" style="overflow-x:auto"><div class="ct" style="margin-bottom:6px">📋 多维估值交叉印证与定投明细表</div>'
+        f'{bar_section}'
+        f'<div class="cd" style="overflow-x:auto"><div class="ct" style="margin-bottom:5px">📋 多维估值交叉印证与定投明细表</div>'
         f'<table class="vt"><thead><tr><th>指数名称</th><th>PE(5年分位)</th><th>PB(5年分位)</th><th>股息率/ROE</th><th>状态与定投建议</th></tr></thead>'
         f'<tbody>{"".join(table_rows)}</tbody></table></div></div>'
     )
@@ -607,8 +606,8 @@ def build_wechat_html(df: pd.DataFrame, cn_bond_10y: float = 2.12) -> str:
     return html
 
 
-def send_via_pushplus(token: str, title: str, html_content: str, topic: str = "") -> bool:
-    """通过 PushPlus 将 HTML 报表推送到个人微信。"""
+def send_via_pushplus(token: str, title: str, html_content: str, fallback_html: str = "", topic: str = "") -> bool:
+    """通过 PushPlus 将 HTML 报表推送到个人微信；若遇字数超限自动降级发送精简版。"""
     url = "http://www.pushplus.plus/send"
     payload = {
         "token": token,
@@ -625,9 +624,16 @@ def send_via_pushplus(token: str, title: str, html_content: str, topic: str = ""
         if res_json.get("code") == 200:
             print(f"[推送成功] PushPlus 消息已受理，流水号: {res_json.get('data')}")
             return True
-        else:
-            print(f"[推送失败] PushPlus 返回异常: {res_json}")
-            return False
+        if res_json.get("code") == 999 and fallback_html:
+            print("[自动降级] 检测到内容字数限制，正在使用精简版 HTML 重新发送...")
+            payload["content"] = fallback_html
+            resp2 = requests.post(url, json=payload, timeout=15)
+            res_json2 = resp2.json()
+            if res_json2.get("code") == 200:
+                print(f"[推送成功] 精简版消息已受理，流水号: {res_json2.get('data')}")
+                return True
+        print(f"[推送失败] PushPlus 返回异常: {res_json}")
+        return False
     except Exception as e:
         print(f"[推送异常] 请求 PushPlus 接口出错: {e}")
         return False
@@ -654,6 +660,7 @@ def main() -> None:
 
     html_path = pathlib.Path(args.output_html)
     title_path = pathlib.Path(args.title_file)
+    fallback_html = ""
 
     if not args.send_only:
         start_ts = time.perf_counter()
@@ -685,7 +692,8 @@ def main() -> None:
             sys.exit(1)
 
         df_val = pd.DataFrame(records)
-        html_content = build_wechat_html(df_val)
+        html_content = build_wechat_html(df_val, compact_only=False)
+        fallback_html = build_wechat_html(df_val, compact_only=True)
         html_path.write_text(html_content, encoding="utf-8")
 
         report_date = df_val["latest_date"].max()
@@ -707,9 +715,12 @@ def main() -> None:
     pushplus_topic = os.environ.get("PUSHPLUS_TOPIC", "").strip()
 
     if pushplus_token:
-        send_via_pushplus(pushplus_token, title, html_content, topic=pushplus_topic)
+        ok = send_via_pushplus(pushplus_token, title, html_content, fallback_html=fallback_html, topic=pushplus_topic)
+        if not ok:
+            sys.exit(1)
     else:
-        print("[提示] 未检测到环境变量 PUSHPLUS_TOKEN，已跳过 PushPlus 微信推送。")
+        print("[错误] 未检测到环境变量 PUSHPLUS_TOKEN！请在 GitHub Settings -> Secrets and variables -> Actions 中添加 PUSHPLUS_TOKEN。")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
