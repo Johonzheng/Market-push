@@ -1,31 +1,37 @@
-name: Daily Index Valuation WeChat Push
+name: 每日市场与指数估值晚报推送
 
 on:
-  # 由 Cloudflare Workers Cron 准时通过 workflow_dispatch API 触发
   workflow_dispatch:
 
 jobs:
   valuation-push:
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+    timeout-minutes: 5
+
     steps:
-      - name: 1. 检出仓库代码与配置文件
+      - name: 1. 拉取仓库代码
         uses: actions/checkout@v4
 
-      - name: 2. 配置 Python 3.11 环境（启用依赖缓存）
+      - name: 2. 配置 Python 与 pip 缓存
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
           cache-dependency-path: '.github/workflows/daily_valuation.yml'
 
-      - name: 3. 极速安装轻量依赖库（3秒完成）
+      - name: 3. 安装轻量 Python 依赖
         run: |
-          pip install pandas numpy requests openpyxl
+          pip install --no-cache-dir pandas numpy requests openpyxl
 
-      - name: 4. 并发拉取多维估值数据并推送到个人微信
+      - name: 4. 拉取万得官方 wind-mcp-skill CLI（用于补查缺失指数与全市场资金情绪）
+        run: |
+          git clone --depth 1 https://github.com/Wind-Alice/AliceMarket.git /tmp/AliceMarket
+
+      - name: 5. 计算指数 PE-TTM 估值、全市场情绪并推送到微信
         env:
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
           PUSHPLUS_TOPIC: ${{ secrets.PUSHPLUS_TOPIC }}
+          WIND_API_KEY: ${{ secrets.WIND_API_KEY }}
+          WIND_MCP_SKILL_DIR: /tmp/AliceMarket/skills/wind-mcp-skill
         run: |
           python valuation_push.py --config indices.json
