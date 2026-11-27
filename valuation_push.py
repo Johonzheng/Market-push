@@ -772,9 +772,11 @@ def fetch_wind_batch_pe_snapshot(wind_codes: list[str]) -> dict[str, dict[str, A
         code_val = str(_find_field(r, ("windcode", "代码", "证券代码", "指数代码", "code", "_key")) or "").upper()
         for wc in wind_codes:
             if wc.upper() in code_val or wc.split(".")[0].upper() in code_val:
+                raw_pe = _to_float(_find_field(r, ("市盈率(TTM)", "PE-TTM", "PE_TTM", "市盈率"), exclude=("预测", "分位")))
+                raw_pb = _to_float(_find_field(r, ("市净率(LF)", "PB(LF)", "市净率"), exclude=("分位",)))
                 snap_map[wc.upper()] = {
-                    "pe": _to_float(_find_field(r, ("市盈率(TTM)", "PE-TTM", "PE_TTM", "市盈率"), exclude=("预测", "分位"))),
-                    "pb": _to_float(_find_field(r, ("市净率(LF)", "PB(LF)", "市净率"), exclude=("分位",))),
+                    "pe": raw_pe if (raw_pe is not None and 0.5 < raw_pe < 500.0) else None,
+                    "pb": raw_pb if (raw_pb is not None and 0.05 < raw_pb < 100.0) else None,
                     "date": _parse_date_str(_find_field(r, ("最新交易日", "交易日期", "date"))),
                 }
                 break
@@ -872,8 +874,10 @@ def fetch_wind_index_valuation(
         idx_style = "dividend"
 
     today = dt.date.today()
-    current_pe = struct_snap.get("pe") if struct_snap else None
-    current_pb = struct_snap.get("pb") if struct_snap else None
+    raw_s_pe = struct_snap.get("pe") if struct_snap else None
+    raw_s_pb = struct_snap.get("pb") if struct_snap else None
+    current_pe = raw_s_pe if (raw_s_pe is not None and 0.5 < raw_s_pe < 500.0) else None
+    current_pb = raw_s_pb if (raw_s_pb is not None and 0.05 < raw_s_pb < 100.0) else None
     latest_date = struct_snap.get("date") if struct_snap else None
     div_yield: float | None = None
     pe_pct: float | None = None
@@ -912,7 +916,7 @@ def fetch_wind_index_valuation(
             else:
                 print(f"[Wind调试-月频未达标] {wind_code} 点数={n_pts} 跨度={span_days}天 首行={sample}")
 
-    if current_pe is None or pe_pct is None or pe_pct <= 0.0:
+    if current_pe is None or current_pe <= 0.5 or pe_pct is None or pe_pct <= 0.0:
         p_prev = (pct_payload if isinstance(pct_payload, str) else json.dumps(pct_payload, ensure_ascii=False))[:220]
         print(f"[Wind未命中] {name} ({wind_code}): pe={current_pe} pct={pe_pct} | 预览={p_prev}")
         return None, None
@@ -1373,7 +1377,7 @@ def build_wechat_html(
     if not compact_only:
         bar_section = (
             f'<div class="cd"><div class="ct">🎯 近5年PE-TTM分位与定投信号</div>'
-            f'<div class="cs">近5年分位阈值：<b class="c0">30%低估</b> / <b class="c1">50%中位</b> / <b class="c3">70%高估</b></div>'
+            f'<div class="cs">近5年分位：<b class="c0">&lt;30%低估</b> / <b class="c1">30-50%偏低</b> / <b class="c2">50-70%偏高</b> / <b class="c3">&gt;70%高估</b></div>'
             f'{"".join(bar_rows)}</div>'
         )
 
