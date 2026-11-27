@@ -4,9 +4,11 @@
 每日市场情绪与指数估值晚报微信推送系统 (蛋卷 + 中证 + 万得Wind Alice Market 混合增强版)
 核心特性：
 1. 三级真实数据源：雪球蛋卷(PE-TTM/PB/股息率/ROE) + 中证指数官网JSON + 万得Wind Alice Market(wind-mcp-skill)
-2. 零静态假数据：缺失/停更(>10天)自动走 Wind 官方 MCP 补齐（含日经225/东证 5年日频 PE-TTM 序列自算分位）
-3. 新增全市场盘面与资金面看板：通过 Wind 单次批量调用获取 A股全市场成交额、涨跌家数/赚钱效应、主力净流入、核心宽基当日涨跌幅
-4. 重构移动端微信 HTML 排版：严格控制在 PushPlus 20,000 字符上限内，超限自动降级精简版
+2. 零静态假数据：缺失/停更(>10天)自动走 Wind 官方 MCP 补齐：
+   - 先用结构化接口 get_index_price_indicators 一次批量拿到准确 PE-TTM / PB(LF) / 最新交易日
+   - 再用 get_index_fundamentals 补齐近5年PE分位与股息率（日经225/东证分位返回0时自动拉5年日频序列自算）
+3. 全市场盘面与资金面看板：单次批量调用获取 A股全市场成交额、涨跌家数/赚钱效应、主力净流入、核心宽基涨跌幅
+4. 移动端微信 HTML 排版：严格控制在 PushPlus 20,000 字符上限内，超限自动降级精简版
 5. 保留 SENSEX -> BSE30 敏感词防拦截、红利策略高股息(>=4.5%)防机械卖飞规则
 """
 
@@ -36,7 +38,6 @@ import requests
 socket.setdefaulttimeout(5.0)
 _ORIG_SESSION_REQUEST = requests.Session.request
 
-# 超过 10 个自然日未更新（兼容国庆/春节长假+周末）即判定为接口数据停更
 MAX_STALE_DAYS = 10
 PUSHPLUS_SAFE_CHAR_LIMIT = 18500
 
@@ -410,10 +411,7 @@ def call_wind_mcp(
     params: dict[str, Any],
     timeout_sec: int = 35,
 ) -> tuple[Any, str | None]:
-    """
-    通过 Wind 官方 wind-mcp-skill CLI 调用 MCP 工具。
-    返回 (payload, error_code)：成功时 error_code 为 None；失败时返回具体错误码。
-    """
+    """通过 Wind 官方 wind-mcp-skill CLI 调用 MCP 工具。"""
     skill_dir = _locate_wind_skill_dir()
     if skill_dir is None:
         return None, "SKILL_NOT_FOUND"
@@ -441,7 +439,6 @@ def call_wind_mcp(
         print(f"[Wind空回执] {server_type}.{tool_name} exit={proc.returncode} stderr={stderr_short}")
         return None, "EMPTY_RESPONSE"
 
-    # CLI 可能在 JSON 前后输出非 JSON 日志行，提取首个完整 JSON 对象
     raw_obj: Any = None
     try:
         raw_obj = json.loads(stdout)
@@ -462,7 +459,6 @@ def call_wind_mcp(
         print(f"[Wind错误] {server_type}.{tool_name} -> {err_code}: {err_msg}")
         return None, err_code
 
-    # 按 SKILL.md 规范：后端结果在 content[0].text 里（多为 JSON 字符串）
     content = raw_obj.get("content")
     if isinstance(content, list) and content:
         first = content[0]
@@ -511,24 +507,43 @@ def _parse_date_str(val: Any) -> str | None:
     return None
 
 
-def _extract_table_rows(payload: Any) -> list[dict[str, Any]]:
+def _extract_table_rows(payload: Any, depth: int = 0) -> list[dict[str, Any]]:
     """
-    将 Wind MCP 返回的 JSON（dict/list/columns+rows）或 Markdown 表格统一转为 list[dict]。
+    递归将 Wind MCP 返回的各类 JSON 结构（wide/long/columns+rows/tables/dict-of-lists）
+    或 Markdown 表格统一展平为 list[dict]。
     """
-    if payload is None:
+    if payload is None or depth > 5:
         return []
 
     if isinstance(payload, list):
-        if payload and all(isinstance(x, dict) for x in payload):
-            return payload
-        return []
+        out: list[dict[str, Any]] = []
+        for elem in payload:
+            if isinstance(elem, dict):
+                # 若元素本身是嵌套表格对象（如 tables=[{"columns":[...], "rows":[...]}]）
+                if any(k in elem for k in ("columns", "headers", "rows", "tables", "data")) and not any(
+                    isinstance(v, (int, float)) for k, v in elem.items() if k not in ("code", "status", "total")
+                ):
+                    sub = _extract_table_rows(elem, depth + 1)
+                    if sub:
+                        out.extend(sub)
+                        continue
+                out.append(elem)
+            elif isinstance(elem, str) and "|" in elem:
+                out.extend(_extract_table_rows(elem, depth + 1))
+        return out
 
     if isinstance(payload, dict):
-        # 常见表格包装结构: {"data": [...]} / {"rows": [...]} / {"columns": [...], "rows": [[...]]}
-        if isinstance(payload.get("columns"), list) and isinstance(payload.get("rows"), list):
-            cols = [c.get("name", c.get("field", str(c))) if isinstance(c, dict) else str(c) for c in payload["columns"]]
+        # 1) columns/headers + rows/data/values 二维数组结构
+        col_list = payload.get("columns") or payload.get("headers") or payload.get("fields") or payload.get("titles")
+        row_list = payload.get("rows") or payload.get("data") or payload.get("values") or payload.get("records")
+        if isinstance(col_list, list) and isinstance(row_list, list) and col_list and row_list:
+            cols = [
+                str(c.get("title") or c.get("name") or c.get("label") or c.get("field") or c)
+                if isinstance(c, dict) else str(c)
+                for c in col_list
+            ]
             out = []
-            for r in payload["rows"]:
+            for r in row_list:
                 if isinstance(r, dict):
                     out.append(r)
                 elif isinstance(r, list) and len(r) == len(cols):
@@ -536,22 +551,39 @@ def _extract_table_rows(payload: Any) -> list[dict[str, Any]]:
             if out:
                 return out
 
-        for key in ("data", "items", "rows", "records", "list", "result", "results", "series", "values"):
+        # 2) 常见容器字段递归拆包
+        for key in ("tables", "table", "data", "items", "rows", "records", "list", "result", "results", "series", "values", "content", "answer", "text"):
             sub = payload.get(key)
-            if isinstance(sub, list) and sub:
-                rows = _extract_table_rows(sub)
+            if sub is None:
+                continue
+            if isinstance(sub, (list, dict)):
+                rows = _extract_table_rows(sub, depth + 1)
                 if rows:
                     return rows
-            elif isinstance(sub, dict):
-                rows = _extract_table_rows(sub)
-                if rows:
-                    return rows
-            elif isinstance(sub, str) and "|" in sub:
-                rows = _extract_table_rows(sub)
-                if rows:
-                    return rows
+            elif isinstance(sub, str):
+                s_strip = sub.strip()
+                if s_strip.startswith(("{", "[")):
+                    try:
+                        rows = _extract_table_rows(json.loads(s_strip), depth + 1)
+                        if rows:
+                            return rows
+                    except json.JSONDecodeError:
+                        pass
+                if "|" in s_strip:
+                    rows = _extract_table_rows(s_strip, depth + 1)
+                    if rows:
+                        return rows
 
-        # 键为 windcode 的嵌套字典: {"000985.CSI": {...}, "000300.SH": {...}}
+        # 3) 字典值全为等长数组（列式存储: {"日期": [...], "PE": [...]}）
+        list_vals = {k: v for k, v in payload.items() if isinstance(v, list) and len(v) >= 2}
+        if len(list_vals) >= 2:
+            lengths = {len(v) for v in list_vals.values()}
+            if len(lengths) == 1:
+                n = next(iter(lengths))
+                keys = list(list_vals.keys())
+                return [{k: list_vals[k][i] for k in keys} for i in range(n)]
+
+        # 4) 键为 windcode 的嵌套字典: {"000985.CSI": {...}, "000300.SH": {...}}
         if payload and all(isinstance(v, dict) for v in payload.values()):
             out = []
             for k, v in payload.items():
@@ -563,13 +595,14 @@ def _extract_table_rows(payload: Any) -> list[dict[str, Any]]:
         return [payload]
 
     if isinstance(payload, str):
-        # 解析 Markdown 表格
         lines = [ln.strip() for ln in payload.splitlines() if ln.strip()]
         table_lines = [ln for ln in lines if ln.startswith("|") and ln.endswith("|")]
         if len(table_lines) >= 3:
             headers = [h.strip() for h in table_lines[0].strip("|").split("|")]
             out = []
             for ln in table_lines[2:]:
+                if re.match(r"^\|[\s:\-|]+\|$", ln):
+                    continue
                 cells = [c.strip() for c in ln.strip("|").split("|")]
                 if len(cells) == len(headers):
                     out.append(dict(zip(headers, cells)))
@@ -594,7 +627,6 @@ def _normalize_amount_to_yi(raw_val: Any, unit_hint: str = "") -> float | None:
         return v * 0.01
     if "万" in s:
         return v / 10000.0
-    # 无显式单位时按绝对量级安全推断（全市场成交额/资金流通常为元或万元）
     if abs(v) >= 1e9:
         return v / 1e8
     if abs(v) >= 1e5:
@@ -618,11 +650,60 @@ def _find_field(row: dict[str, Any], keywords: tuple[str, ...], exclude: tuple[s
     return None
 
 
+def _extract_metrics_from_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """
+    同时兼容宽表（每列一个指标）与长表（每行一个指标，如 {"指标": "PE-TTM", "数值": 21.68}）提取估值指标。
+    """
+    res: dict[str, Any] = {
+        "pe": None,
+        "pe_pct": None,
+        "pb": None,
+        "dy": None,
+        "date": None,
+    }
+    for r in rows:
+        # 1) 尝试宽表列匹配
+        if res["pe"] is None:
+            v = _to_float(_find_field(r, ("市盈率(TTM)", "PE-TTM", "PE_TTM", "滚动市盈率", "市盈率", "PE"), exclude=("分位", "预测")))
+            if v is not None and 0.5 < v < 500:
+                res["pe"] = v
+        if res["pe_pct"] is None:
+            v = _to_float(_find_field(r, ("5年分位", "过去5年", "分位数", "分位", "percentile")))
+            if v is not None and 0.0 <= v <= 100.0:
+                res["pe_pct"] = v
+        if res["pb"] is None:
+            v = _to_float(_find_field(r, ("市净率(LF)", "PB(LF)", "PB_LF", "市净率", "PB"), exclude=("分位",)))
+            if v is not None and 0.05 < v < 100:
+                res["pb"] = v
+        if res["dy"] is None:
+            v = _to_float(_find_field(r, ("股息率", "dividend", "dyr")))
+            if v is not None and 0.0 < v < 50:
+                res["dy"] = v
+        if res["date"] is None:
+            d = _parse_date_str(_find_field(r, ("最新交易日", "交易日期", "截止日期", "日期", "date", "时间")))
+            if d:
+                res["date"] = d
+
+        # 2) 尝试长表行匹配（如 {"指标名称": "市盈率(TTM)", "最新值": 21.68}）
+        label = str(_find_field(r, ("指标名称", "指标", "名称", "字段", "item", "metric", "name", "indicator")) or "")
+        val_raw = _find_field(r, ("最新值", "数值", "值", "当前值", "value", "val", "数据"))
+        if label and val_raw is not None:
+            ll = label.lower()
+            v = _to_float(val_raw)
+            if v is not None:
+                if ("分位" in label or "percentile" in ll) and res["pe_pct"] is None and 0.0 <= v <= 100.0:
+                    res["pe_pct"] = v
+                elif any(k in ll for k in ("pe-ttm", "pe_ttm", "滚动市盈率", "市盈率(ttm)", "市盈率")) and "分位" not in label and "预测" not in label and res["pe"] is None and 0.5 < v < 500:
+                    res["pe"] = v
+                elif any(k in ll for k in ("pb", "市净率")) and "分位" not in label and res["pb"] is None and 0.05 < v < 100:
+                    res["pb"] = v
+                elif any(k in ll for k in ("股息率", "dividend", "dyr")) and res["dy"] is None and 0.0 < v < 50:
+                    res["dy"] = v
+    return res
+
+
 def fetch_market_pulse_wind(demo_mode: bool = False) -> dict[str, Any] | None:
-    """
-    通过 Wind `index_data.get_index_price_indicators` 单次批量拉取：
-    A股全市场成交额、全市场涨跌家数(赚钱效应)、主力资金净流入，及核心宽基当日涨跌幅。
-    """
+    """通过 Wind `index_data.get_index_price_indicators` 单次批量拉取全市场盘面与资金情绪。"""
     if demo_mode:
         return {
             "trade_date": dt.date.today().strftime("%Y-%m-%d"),
@@ -651,7 +732,6 @@ def fetch_market_pulse_wind(demo_mode: bool = False) -> dict[str, Any] | None:
         ("HSTECH.HI",  "恒生科技"),
     ]
     windcodes = ",".join(code for code, _ in bench_meta)
-    # 所有字段逐字复制自 references/index-indicators.md
     indexes = "最新交易日,最新成交价,涨跌幅,成交额,当日主力净流入额,上涨家数,下跌家数,平盘家数"
     payload, err = call_wind_mcp(
         "index_data",
@@ -718,6 +798,38 @@ def fetch_market_pulse_wind(demo_mode: bool = False) -> dict[str, Any] | None:
     }
 
 
+def fetch_wind_batch_pe_snapshot(wind_codes: list[str]) -> dict[str, dict[str, Any]]:
+    """
+    先用结构化工具 `get_index_price_indicators` 一次批量获取缺失指数的准确 PE-TTM / PB(LF) / 最新交易日。
+    """
+    if not wind_codes or not _is_wind_enabled():
+        return {}
+    payload, err = call_wind_mcp(
+        "index_data",
+        "get_index_price_indicators",
+        {"windcode": ",".join(wind_codes), "indexes": "最新交易日,市盈率(TTM),市净率(LF)"},
+        timeout_sec=30,
+    )
+    if err or payload is None:
+        return {}
+
+    rows = _extract_table_rows(payload)
+    snap_map: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        code_val = str(_find_field(r, ("windcode", "代码", "证券代码", "指数代码", "code", "_key")) or "").upper()
+        for wc in wind_codes:
+            if wc.upper() in code_val or wc.split(".")[0].upper() in code_val:
+                snap_map[wc.upper()] = {
+                    "pe": _to_float(_find_field(r, ("市盈率(TTM)", "PE-TTM", "PE_TTM", "市盈率"), exclude=("预测", "分位"))),
+                    "pb": _to_float(_find_field(r, ("市净率(LF)", "PB(LF)", "市净率"), exclude=("分位",))),
+                    "date": _parse_date_str(_find_field(r, ("最新交易日", "交易日期", "date"))),
+                }
+                break
+    if snap_map:
+        print(f"[Wind快照] 结构化批量拉取成功: {list(snap_map.keys())}")
+    return snap_map
+
+
 def _extract_pe_series_from_wind(payload: Any) -> pd.Series | None:
     """从 Wind `get_index_fundamentals` 历史序列返回体中提取 (日期 -> PE-TTM) 序列。"""
     rows = _extract_table_rows(payload)
@@ -726,16 +838,17 @@ def _extract_pe_series_from_wind(payload: Any) -> pd.Series | None:
 
     for r in rows:
         d_raw = _find_field(r, ("日期", "交易日", "trade_date", "date", "时间"))
-        v_raw = _find_field(r, ("市盈率(TTM)", "PE-TTM", "PE_TTM", "滚动市盈率", "市盈率", "PE", "value"), exclude=("分位", "预测"))
+        v_raw = _find_field(r, ("市盈率(TTM)", "PE-TTM", "PE_TTM", "滚动市盈率", "市盈率", "PE", "数值", "value"), exclude=("分位", "预测"))
         d = _parse_date_str(d_raw)
         v = _to_float(v_raw)
         if d and v is not None and 0.5 < v < 500.0:
             dates.append(d)
             vals.append(v)
 
-    if len(vals) < 15 and isinstance(payload, str):
-        # 兜底正则：匹配 "2026-11-26: 19.28" 或 "2026-11-26 | 19.28"
-        for m in re.finditer(r"(20\d{2}[-/]\d{1,2}[-/]\d{1,2})[^\d\n]{1,20}(\d{1,3}\.\d{1,4})", payload):
+    if len(vals) < 15:
+        raw_text = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)
+        # 匹配 JSON/文本中的 ("2026-11-26" ... 19.28)
+        for m in re.finditer(r"(20\d{2}[-/]\d{1,2}[-/]\d{1,2})[^\d\n]{1,35}(\d{1,3}\.\d{1,4})", raw_text):
             d = _parse_date_str(m.group(1))
             v = _to_float(m.group(2))
             if d and v is not None and 0.5 < v < 500.0:
@@ -750,11 +863,13 @@ def _extract_pe_series_from_wind(payload: Any) -> pd.Series | None:
     return df.set_index("date")["val"]
 
 
-def fetch_wind_index_valuation(item: dict[str, str]) -> tuple[dict[str, Any] | None, str | None]:
+def fetch_wind_index_valuation(
+    item: dict[str, str],
+    struct_snap: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any] | None, str | None]:
     """
-    通过 Wind `index_data.get_index_fundamentals` 补查单只缺失指数的：
-    PE-TTM、近5年PE分位、PB(LF)、股息率。
-    若 Wind 返回的 5 年分位字段为空或异常为 0（如 N225.GI / TOPX.GI），自动拉取近 5 年日频序列自行计算真实序号分位。
+    结合结构化快照 (PE-TTM/PB/日期) + `get_index_fundamentals` (5年分位/股息率/5年序列自算)
+    补齐单只缺失指数。
     """
     core_code = item["code"]
     display_code = item["display_code"]
@@ -767,48 +882,58 @@ def fetch_wind_index_valuation(item: dict[str, str]) -> tuple[dict[str, Any] | N
         idx_style = "dividend"
 
     today = dt.date.today()
-    q_snap = (
-        f"查询{wind_code}最新交易日的滚动市盈率PE-TTM、"
-        f"最新PE-TTM在过去5年分位数、市净率PB(LF)和股息率"
-    )
+    current_pe = struct_snap.get("pe") if struct_snap else None
+    current_pb = struct_snap.get("pb") if struct_snap else None
+    latest_date = struct_snap.get("date") if struct_snap else None
+    pe_pct: float | None = None
+    div_yield: float | None = None
+
+    q_snap = f"查询{wind_code}最新交易日的滚动市盈率PE-TTM、最新PE在过去5年分位数、市净率PB(LF)和股息率"
     payload, err = call_wind_mcp("index_data", "get_index_fundamentals", {"question": q_snap}, timeout_sec=35)
     if err:
         return None, err
 
     rows = _extract_table_rows(payload)
-    row = rows[-1] if rows else {}
+    parsed = _extract_metrics_from_rows(rows)
+    if current_pe is None:
+        current_pe = parsed["pe"]
+    if pe_pct is None:
+        pe_pct = parsed["pe_pct"]
+    if current_pb is None:
+        current_pb = parsed["pb"]
+    if div_yield is None:
+        div_yield = parsed["dy"]
+    if not latest_date:
+        latest_date = parsed["date"]
 
-    current_pe = _to_float(_find_field(row, ("市盈率(TTM)", "PE-TTM", "PE_TTM", "滚动市盈率", "市盈率", "PE"), exclude=("分位", "预测")))
-    pe_pct = _to_float(_find_field(row, ("5年分位", "过去5年", "分位数", "分位", "percentile")))
-    current_pb = _to_float(_find_field(row, ("市净率(LF)", "PB(LF)", "PB_LF", "市净率", "PB"), exclude=("分位",)))
-    div_yield = _to_float(_find_field(row, ("股息率", "dividend", "dyr")))
-    latest_date = _parse_date_str(_find_field(row, ("最新交易日", "交易日期", "截止日期", "日期", "date")))
-
-    # 若文本形态未命中表格，尝试直接从文本中抽取关键值
-    if current_pe is None and isinstance(payload, str):
-        m_pe = re.search(r"(?:PE-TTM|滚动市盈率|市盈率)[^\d\n]{0,12}(\d{1,3}\.\d{1,4})", payload, re.IGNORECASE)
+    # 文本兜底正则
+    raw_str = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)
+    if current_pe is None:
+        m_pe = re.search(r"(?:PE-TTM|PE_TTM|滚动市盈率|市盈率\(TTM\))[^\d\n]{0,20}(\d{1,3}\.\d{1,4})", raw_str, re.IGNORECASE)
         if m_pe:
             current_pe = _to_float(m_pe.group(1))
-        m_pct = re.search(r"(?:5年分位|分位数)[^\d\n]{0,12}(\d{1,3}(?:\.\d{1,2})?)%?", payload)
+    if pe_pct is None:
+        m_pct = re.search(r"(?:5年分位|过去5年[^\d]{0,8}|分位数)[^\d\n]{0,20}(\d{1,3}(?:\.\d{1,4})?)%?", raw_str)
         if m_pct:
             pe_pct = _to_float(m_pct.group(1))
-        m_pb = re.search(r"(?:PB\(LF\)|市净率)[^\d\n]{0,12}(\d{1,2}\.\d{1,4})", payload, re.IGNORECASE)
+    if current_pb is None:
+        m_pb = re.search(r"(?:PB\(LF\)|PB_LF|市净率)[^\d\n]{0,20}(\d{1,2}\.\d{1,4})", raw_str, re.IGNORECASE)
         if m_pb:
             current_pb = _to_float(m_pb.group(1))
-        m_dy = re.search(r"股息率[^\d\n]{0,12}(\d{1,2}\.\d{1,4})%?", payload)
+    if div_yield is None:
+        m_dy = re.search(r"股息率[^\d\n]{0,20}(\d{1,2}\.\d{1,4})%?", raw_str)
         if m_dy:
             div_yield = _to_float(m_dy.group(1))
-        if not latest_date:
-            latest_date = _parse_date_str(payload)
+    if not latest_date:
+        latest_date = _parse_date_str(raw_str)
 
-    # 若分位数为小数形式 (0 < x <= 1.0) 换算成百分比
     if pe_pct is not None and 0.0 < pe_pct <= 1.0:
         pe_pct = round(pe_pct * 100.0, 1)
 
-    # 针对 N225.GI / TOPX.GI 等 5年分位返回 0 或空的情况，自动拉取近 5 年日频 PE-TTM 序列自行计算分位
+    # 针对 N225.GI / TOPX.GI 等 5年分位返回 0 或空的情况，拉取近 5 年日频 PE-TTM 序列自行计算分位
     if current_pe is None or pe_pct is None or pe_pct <= 0.1:
         start_5y = (today - dt.timedelta(days=365 * 5 + 10)).strftime("%Y-%m-%d")
-        q_hist = f"查询{wind_code}从{start_5y}至{today.strftime('%Y-%m-%d')}的日频滚动市盈率PE-TTM历史序列"
+        q_hist = f"查询{wind_code}从{start_5y}至{today.strftime('%Y-%m-%d')}每日滚动市盈率PE-TTM历史数据"
         hist_payload, hist_err = call_wind_mcp("index_data", "get_index_fundamentals", {"question": q_hist}, timeout_sec=45)
         if not hist_err and hist_payload is not None:
             pe_series = _extract_pe_series_from_wind(hist_payload)
@@ -818,8 +943,12 @@ def fetch_wind_index_valuation(item: dict[str, str]) -> tuple[dict[str, Any] | N
                 pe_pct = round(float((pe_series <= current_pe).mean() * 100.0), 1)
                 if not latest_date:
                     latest_date = pd.Timestamp(pe_series.index[-1]).strftime("%Y-%m-%d")
+            else:
+                hist_preview = (hist_payload if isinstance(hist_payload, str) else json.dumps(hist_payload, ensure_ascii=False))[:240]
+                print(f"[Wind调试-序列] {wind_code} 返回预览: {hist_preview}")
 
     if current_pe is None or pe_pct is None or pe_pct <= 0.0:
+        print(f"[Wind调试-快照] {wind_code} parsed_pe={current_pe} parsed_pct={pe_pct} 原始预览: {raw_str[:240]}")
         print(f"[Wind未命中] {name} ({wind_code}): 未获取到有效 PE-TTM 或 5年分位。")
         return None, None
 
@@ -1390,7 +1519,6 @@ def main() -> None:
         unavail_records: list[dict[str, Any]] = []
         item_by_code = {it["code"]: it for it in indices}
 
-        # Tier-1 并发拉取（蛋卷 + 中证）
         with ThreadPoolExecutor(max_workers=8) as executor:
             future_map = {
                 executor.submit(compute_index_valuation, item, batch_snapshot, args.demo): item
@@ -1418,28 +1546,33 @@ def main() -> None:
                         "reason": "接口请求异常",
                     })
 
-        # Tier-2 Wind Alice Market 增强：1) 全市场盘面情绪；2) 自动串行补齐缺失/停更指数
         market_pulse = fetch_market_pulse_wind(demo_mode=args.demo)
         if not args.demo and _is_wind_enabled():
             need_wind = [r for r in unavail_records] + [r for r in stale_records]
             if need_wind:
-                print(f"[Wind补查] 准备通过万得 MCP 串行补齐 {len(need_wind)} 只缺失/停更指数...")
+                print(f"[Wind补查] 准备通过万得 MCP 补齐 {len(need_wind)} 只缺失/停更指数...")
+                wind_codes = [
+                    item_by_code.get(r["code"], {}).get("wind_code", r.get("wind_code", r["display_code"]))
+                    for r in need_wind
+                ]
+                struct_snaps = fetch_wind_batch_pe_snapshot(wind_codes)
+
                 still_unavail: list[dict[str, Any]] = []
                 still_stale: list[dict[str, Any]] = []
                 abort_wind = False
 
-                for rec in need_wind:
+                for rec, wc in zip(need_wind, wind_codes):
                     if abort_wind:
                         (still_stale if rec.get("status") == "stale" else still_unavail).append(rec)
                         continue
                     orig_item = item_by_code.get(rec["code"], {
                         "code": rec["code"],
                         "display_code": rec["display_code"],
-                        "wind_code": rec.get("wind_code", rec["display_code"]),
-                        "raw_code": rec.get("wind_code", rec["display_code"]),
+                        "wind_code": wc,
+                        "raw_code": wc,
                         "name": rec["name"],
                     })
-                    w_res, w_err = fetch_wind_index_valuation(orig_item)
+                    w_res, w_err = fetch_wind_index_valuation(orig_item, struct_snap=struct_snaps.get(wc.upper()))
                     if w_err in ("AUTH_ERROR", "RATE_LIMIT_ERROR", "AUTH_MISSING", "SKILL_NOT_FOUND"):
                         print(f"[Wind熔断] 遇到 {w_err}，停止后续补查。")
                         abort_wind = True
