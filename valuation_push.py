@@ -899,22 +899,27 @@ def fetch_wind_index_valuation(
     if p_pct is not None and p_pct > 0.1:
         pe_pct = p_pct
 
-    # Step B：若官方 5 年分位列为空或异常为 0（如日经225 / 东证），拉取近 5 年“每月末”PE-TTM（约60行，绝不触发100行截断）
+    # Step B：若官方 5 年分位列为空或异常为 0（如日经225 / 东证），拉取近 5 年“每月末”PE-TTM（约60行，绝不触发100行截断；失败自动换简明问句重试1次）
     if pe_pct is None or pe_pct <= 0.1:
         start_5y = (today - dt.timedelta(days=365 * 5 + 15)).strftime("%Y-%m-%d")
-        q_month = f"查询{wind_name}({wind_code})从{start_5y}至{today.strftime('%Y-%m-%d')}每月末的滚动市盈率PE_TTM"
-        m_payload, m_err = call_wind_mcp("index_data", "get_index_fundamentals", {"question": q_month}, timeout_sec=45)
-        if not m_err and m_payload is not None:
-            pe_series, n_pts, span_days, sample = _extract_pe_series_from_wind(m_payload)
-            if pe_series is not None:
-                if current_pe is None:
-                    current_pe = float(pe_series.iloc[-1])
-                if not latest_date:
-                    latest_date = pd.Timestamp(pe_series.index[-1]).strftime("%Y-%m-%d")
-                pe_pct = round(float((pe_series <= current_pe).mean() * 100.0), 1)
-                mode_tag = f"{n_pts}月"
-            else:
-                print(f"[Wind调试-月频未达标] {wind_code} 点数={n_pts} 跨度={span_days}天 首行={sample}")
+        month_queries = [
+            f"查询{wind_name}({wind_code})从{start_5y}至{today.strftime('%Y-%m-%d')}每月末的滚动市盈率PE_TTM",
+            f"查询{wind_code}近5年每月市盈率PE历史数据",
+        ]
+        for q_idx, q_month in enumerate(month_queries):
+            m_payload, m_err = call_wind_mcp("index_data", "get_index_fundamentals", {"question": q_month}, timeout_sec=50)
+            if not m_err and m_payload is not None:
+                pe_series, n_pts, span_days, sample = _extract_pe_series_from_wind(m_payload)
+                if pe_series is not None:
+                    if current_pe is None or current_pe <= 0.5:
+                        current_pe = float(pe_series.iloc[-1])
+                    if not latest_date:
+                        latest_date = pd.Timestamp(pe_series.index[-1]).strftime("%Y-%m-%d")
+                    pe_pct = round(float((pe_series <= current_pe).mean() * 100.0), 1)
+                    mode_tag = f"{n_pts}月"
+                    break
+                else:
+                    print(f"[Wind调试-月频第{q_idx+1}次未达标] {wind_code} 点数={n_pts} 跨度={span_days}天 首行={sample}")
 
     if current_pe is None or current_pe <= 0.5 or pe_pct is None or pe_pct <= 0.0:
         p_prev = (pct_payload if isinstance(pct_payload, str) else json.dumps(pct_payload, ensure_ascii=False))[:220]
