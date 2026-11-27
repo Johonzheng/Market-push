@@ -136,8 +136,8 @@ INDEX_ALIAS_MAP: dict[str, dict[str, Any]] = {
     "N225":    {"display_code": "N225.NK",    "wind_code": "N225.NK",    "wind_name": "日经225",        "danjuan": [], "csindex": "",       "style": "overseas", "prefer_wind": True},
     "TOPX":    {"display_code": "TOPX.T",     "wind_code": "TOPX.T",     "wind_name": "东证指数",       "danjuan": [], "csindex": "",       "style": "overseas", "prefer_wind": True},
     "TOPIX":   {"display_code": "TOPX.T",     "wind_code": "TOPX.T",     "wind_name": "东证指数",       "danjuan": [], "csindex": "",       "style": "overseas", "prefer_wind": True},
-    "FCHI":    {"display_code": "FCHI.PA",    "wind_code": "FCHI.PA",    "wind_name": "法国CAC40",      "danjuan": [], "csindex": "",       "style": "overseas", "prefer_wind": True},
-    "CAC40":   {"display_code": "FCHI.PA",    "wind_code": "FCHI.PA",    "wind_name": "法国CAC40",      "danjuan": [], "csindex": "",       "style": "overseas", "prefer_wind": True},
+    "FCHI":    {"display_code": "FCHI.GI",    "wind_code": "FCHI.GI",    "wind_name": "法国CAC40",      "danjuan": [], "csindex": "",       "style": "overseas", "prefer_wind": True},
+    "CAC40":   {"display_code": "FCHI.GI",    "wind_code": "FCHI.GI",    "wind_name": "法国CAC40",      "danjuan": [], "csindex": "",       "style": "overseas", "prefer_wind": True},
 
     # 其他可选策略指数
     "980092":  {"display_code": "980092.CNI", "wind_code": "980092.CNI", "danjuan": ["CNI980092", "CSI932365"], "csindex": "932365", "style": "dividend", "prefer_wind": False},
@@ -839,7 +839,7 @@ def _extract_explicit_percentile_col(payload: Any) -> tuple[float | None, float 
                 num = _to_float(v)
                 if num is not None and num > 0.1:
                     pe_pct = round(num * 100.0, 1) if num <= 1.0 else (round(num, 1) if num <= 100.0 else None)
-            elif pe_val is None and any(w in kl for w in ("pe_ttm", "pe-ttm", "市盈率(ttm)", "滚动市盈率")) and "分位" not in ks and "预测" not in ks:
+            elif pe_val is None and any(w in kl for w in ("pe_ttm", "pe-ttm", "市盈率", "pe")) and not any(ex in kl for ex in ("分位", "预测", "pb", "股息", "代码", "简称")):
                 num = _to_float(v)
                 if num is not None and 0.5 < num < 500:
                     pe_val = num
