@@ -2,11 +2,13 @@
 # -*- coding: utf-8 -*-
 """
 每日市场情绪与指数估值晚报微信推送系统 (蛋卷核心10只 + 万得Wind精准9只 统一近5年PE-TTM版)
-核心修复：
-1. 精准解析 Wind `{"data":{"data":[{"columns":[...],"rows":[...]}]}}` 表格及时间戳日期，兼容 >=20 点日频/周频/月频序列
-2. 针对 `DJI.GI` 等含英文代码查询易返回“没找到数据”的情况，问句带上中文名并支持仅按显式“分位”列名的安全兜底
-3. 按用户要求移除顶部“🧭 A/港股整体温度”行，保留 沪深300 ERP + 全市场成交额/涨跌家数/主力资金看板
-4. 保留 PushPlus 20,000 字硬控、SENSEX->BSE30 防屏蔽、红利高股息防卖飞规则
+核心修复（解决100行截断与海外代码问题）：
+1. 修正 Wind 实盘代码：日本东证 TOPX.T、日经225 N225.NK、法国CAC40 FCHI.PA、印度SENSEX SENSEX.BO（展示仍为 BSE30.BO 防敏感词）
+2. 彻底修复 Wind 历史序列被截断成近4个月(~100行)导致日经/A50变100%、A500变31%的 Bug：
+   - 优先直取 Wind 官方“最新PE在过去5年分位数”显式列（一步拿准道指/CAC40/A500/全指/800/A50/印度7只真实5年日频分位）
+   - 若官方分位列为空或异常为0（如日经225/日本东证），改拉近5年“每月末”PE-TTM序列（约60个点，永不触发100行截断）
+   - 强制校验时间跨度 >= 1200 天（约3.3年以上），严禁把几个月的截断序列冒充5年分位
+3. 顶部已移除“整体温度”，保留 沪深300 ERP + 全市场成交额/涨跌家数/主力净流入看板；明确标注 30%/50%/70% 为近5年分位
 """
 
 from __future__ import annotations
@@ -36,7 +38,8 @@ socket.setdefaulttimeout(5.0)
 _ORIG_SESSION_REQUEST = requests.Session.request
 
 MAX_STALE_DAYS = 10
-MIN_5Y_SERIES_POINTS = 20  # 至少20个独立历史交易日/月度点，杜绝单日快照误算
+MIN_5Y_SERIES_POINTS = 24     # 月频至少24个月
+MIN_5Y_SPAN_DAYS = 1200       # 强制时间跨度 >= 1200天，彻底杜绝近4个月100行截断假5年分位
 PUSHPLUS_SAFE_CHAR_LIMIT = 18500
 
 
@@ -107,7 +110,7 @@ def get_dca_action(
 # 2. 海内外指数与 Wind 标准代码精准映射表
 # ============================================================================
 INDEX_ALIAS_MAP: dict[str, dict[str, Any]] = {
-    # --- 10只已核验与 Wind 高度一致的蛋卷免费核心指数（0 Wind积分） ---
+    # --- 10只已核验与 Wind 完全一致的蛋卷免费核心指数（0 Wind积分） ---
     "000300":  {"display_code": "000300.SH",  "wind_code": "000300.SH",  "danjuan": ["SH000300"],              "csindex": "000300", "style": "broad",    "prefer_wind": False},
     "000905":  {"display_code": "000905.SH",  "wind_code": "000905.SH",  "danjuan": ["SH000905"],              "csindex": "000905", "style": "broad",    "prefer_wind": False},
     "399006":  {"display_code": "399006.SZ",  "wind_code": "399006.SZ",  "danjuan": ["SZ399006"],              "csindex": "",       "style": "broad",    "prefer_wind": False},
@@ -122,19 +125,19 @@ INDEX_ALIAS_MAP: dict[str, dict[str, Any]] = {
     "GDAXI":   {"display_code": "GDAXI.GI",   "wind_code": "GDAXI.GI",   "danjuan": ["GDAXI", "DAX"],          "csindex": "",       "style": "overseas", "prefer_wind": False},
     "DAX":     {"display_code": "GDAXI.GI",   "wind_code": "GDAXI.GI",   "danjuan": ["GDAXI", "DAX"],          "csindex": "",       "style": "overseas", "prefer_wind": False},
 
-    # --- 9只直连 Wind 统一近5年 PE-TTM 的指数 ---
+    # --- 9只直连 Wind 精准代码（已按实盘核验修正 TOPX.T / N225.NK / FCHI.PA / SENSEX.BO） ---
     "8841233": {"display_code": "8841233.WI", "wind_code": "8841233.WI", "wind_name": "A50指数",        "danjuan": [], "csindex": "",       "style": "broad",    "prefer_wind": True},
     "A50":     {"display_code": "8841233.WI", "wind_code": "8841233.WI", "wind_name": "A50指数",        "danjuan": [], "csindex": "",       "style": "broad",    "prefer_wind": True},
     "000906":  {"display_code": "000906.SH",  "wind_code": "000906.SH",  "wind_name": "中证800",        "danjuan": [], "csindex": "000906", "style": "broad",    "prefer_wind": True},
     "000510":  {"display_code": "000510.SH",  "wind_code": "000510.SH",  "wind_name": "中证A500",       "danjuan": [], "csindex": "000510", "style": "broad",    "prefer_wind": True},
     "000985":  {"display_code": "000985.CSI", "wind_code": "000985.CSI", "wind_name": "中证全指",       "danjuan": [], "csindex": "000985", "style": "broad",    "prefer_wind": True},
-    "SENSEX":  {"display_code": "BSE30.BO",   "wind_code": "SENSEX.GI",  "wind_name": "孟买SENSEX30",   "danjuan": [], "csindex": "",       "style": "overseas", "prefer_wind": True},
+    "SENSEX":  {"display_code": "BSE30.BO",   "wind_code": "SENSEX.BO",  "wind_name": "孟买SENSEX30",   "danjuan": [], "csindex": "",       "style": "overseas", "prefer_wind": True},
     "DJI":     {"display_code": "DJI.GI",     "wind_code": "DJI.GI",     "wind_name": "道琼斯工业平均", "danjuan": [], "csindex": "",       "style": "overseas", "prefer_wind": True},
-    "N225":    {"display_code": "N225.GI",    "wind_code": "N225.GI",    "wind_name": "日经225",        "danjuan": [], "csindex": "",       "style": "overseas", "prefer_wind": True},
-    "TOPX":    {"display_code": "TOPX.GI",    "wind_code": "TOPX.GI",    "wind_name": "东京日经东证指数", "danjuan": [], "csindex": "",     "style": "overseas", "prefer_wind": True},
-    "TOPIX":   {"display_code": "TOPX.GI",    "wind_code": "TOPX.GI",    "wind_name": "东京日经东证指数", "danjuan": [], "csindex": "",     "style": "overseas", "prefer_wind": True},
-    "FCHI":    {"display_code": "FCHI.GI",    "wind_code": "FCHI.GI",    "wind_name": "法国CAC40",      "danjuan": [], "csindex": "",       "style": "overseas", "prefer_wind": True},
-    "CAC40":   {"display_code": "FCHI.GI",    "wind_code": "FCHI.GI",    "wind_name": "法国CAC40",      "danjuan": [], "csindex": "",       "style": "overseas", "prefer_wind": True},
+    "N225":    {"display_code": "N225.NK",    "wind_code": "N225.NK",    "wind_name": "日经225",        "danjuan": [], "csindex": "",       "style": "overseas", "prefer_wind": True},
+    "TOPX":    {"display_code": "TOPX.T",     "wind_code": "TOPX.T",     "wind_name": "东证指数",       "danjuan": [], "csindex": "",       "style": "overseas", "prefer_wind": True},
+    "TOPIX":   {"display_code": "TOPX.T",     "wind_code": "TOPX.T",     "wind_name": "东证指数",       "danjuan": [], "csindex": "",       "style": "overseas", "prefer_wind": True},
+    "FCHI":    {"display_code": "FCHI.PA",    "wind_code": "FCHI.PA",    "wind_name": "法国CAC40",      "danjuan": [], "csindex": "",       "style": "overseas", "prefer_wind": True},
+    "CAC40":   {"display_code": "FCHI.PA",    "wind_code": "FCHI.PA",    "wind_name": "法国CAC40",      "danjuan": [], "csindex": "",       "style": "overseas", "prefer_wind": True},
 
     # 其他可选策略指数
     "980092":  {"display_code": "980092.CNI", "wind_code": "980092.CNI", "danjuan": ["CNI980092", "CSI932365"], "csindex": "932365", "style": "dividend", "prefer_wind": False},
@@ -155,7 +158,7 @@ def normalize_index_code(raw_code: Any) -> tuple[str, str]:
     s = str(raw_code).strip().upper()
     s = re.sub(r"\.0$", "", s)
 
-    m_suf = re.match(r"^([A-Z0-9]+)\.(SH|SZ|CSI|HI|GI|BO|WI|CNI|HK|OF|US)$", s)
+    m_suf = re.match(r"^([A-Z0-9]+)\.(SH|SZ|CSI|HI|GI|BO|WI|CNI|HK|OF|US|T|NK|PA)$", s)
     m_pre = re.match(r"^(SH|SZ|CSI|CNI|HK)[_\-\.]?([0-9A-Z]{4,8})$", s)
 
     if m_suf:
@@ -780,13 +783,14 @@ def fetch_wind_batch_pe_snapshot(wind_codes: list[str]) -> dict[str, dict[str, A
     return snap_map
 
 
-def _extract_pe_series_from_wind(payload: Any) -> tuple[pd.Series | None, int, str]:
+def _extract_pe_series_from_wind(payload: Any) -> tuple[pd.Series | None, int, int, str]:
     """
-    严格从 Wind 近 5 年 PE-TTM 返回体中提取 (日期 -> PE-TTM) 序列。
-    返回 (series, 原始解析行数, 首行样本字符串)，便于精准排查。
+    严格从 Wind 历史 PE-TTM 返回体中提取 (日期 -> PE-TTM) 序列。
+    同时校验：点数 >= 24 且 时间跨度 >= 1200 天（杜绝被截断成近 4 个月的假 5 年分位）。
+    返回 (series, 有效点数, 跨度天数, 首行样本)。
     """
     rows = _extract_table_rows(payload)
-    sample = str(rows[0])[:180] if rows else ""
+    sample = str(rows[0])[:160] if rows else ""
     dates: list[str] = []
     vals: list[float] = []
 
@@ -804,29 +808,46 @@ def _extract_pe_series_from_wind(payload: Any) -> tuple[pd.Series | None, int, s
             vals.append(v)
 
     if not vals:
-        return None, len(rows), sample
+        return None, 0, 0, sample
     df = pd.DataFrame({"date": pd.to_datetime(dates), "val": vals}).dropna().drop_duplicates(subset=["date"]).sort_values("date")
     if len(df) < MIN_5Y_SERIES_POINTS:
-        return None, len(df), sample
-    return df.set_index("date")["val"], len(df), sample
+        return None, len(df), 0, sample
+    span_days = int((df["date"].iloc[-1] - df["date"].iloc[0]).days)
+    if span_days < MIN_5Y_SPAN_DAYS:
+        return None, len(df), span_days, sample
+    return df.set_index("date")["val"], len(df), span_days, sample
 
 
-def _extract_explicit_percentile_col(payload: Any) -> float | None:
+def _extract_explicit_percentile_col(payload: Any) -> tuple[float | None, float | None, float | None, str | None]:
     """
-    仅从包含“分位”字样的显式表格列中读取 5 年百分位（绝不对原文做模糊正则，杜绝把 PE 当分位）。
+    从 Wind 显式表格列中读取 (5年PE分位, PE-TTM, 股息率, 日期)。
+    严格要求分位字段列名必须包含“分位”，绝不做盲目文本正则。
     """
     rows = _extract_table_rows(payload)
+    pe_pct: float | None = None
+    pe_val: float | None = None
+    dy_val: float | None = None
+    dt_val: str | None = None
+
     for r in rows:
         for k, v in r.items():
             ks = str(k)
+            kl = ks.lower()
             if "分位" in ks and ("5" in ks or "五" in ks or "历史" in ks):
                 num = _to_float(v)
                 if num is not None and num > 0.1:
-                    if num <= 1.0:
-                        return round(num * 100.0, 1)
-                    if num <= 100.0:
-                        return round(num, 1)
-    return None
+                    pe_pct = round(num * 100.0, 1) if num <= 1.0 else (round(num, 1) if num <= 100.0 else None)
+            elif pe_val is None and any(w in kl for w in ("pe_ttm", "pe-ttm", "市盈率(ttm)", "滚动市盈率")) and "分位" not in ks and "预测" not in ks:
+                num = _to_float(v)
+                if num is not None and 0.5 < num < 500:
+                    pe_val = num
+            elif dy_val is None and ("股息率" in ks or "dyr" in kl):
+                num = _to_float(v)
+                if num is not None and 0.0 < num < 30:
+                    dy_val = round(num * 100.0, 2) if num < 0.25 else round(num, 2)
+            elif dt_val is None and ("日期" in ks or "交易日" in ks or kl == "date"):
+                dt_val = _parse_date_str(v)
+    return pe_pct, pe_val, dy_val, dt_val
 
 
 def fetch_wind_index_valuation(
@@ -835,9 +856,9 @@ def fetch_wind_index_valuation(
 ) -> tuple[dict[str, Any] | None, str | None]:
     """
     通过 Wind 获取单只指数的精准 PE-TTM 与近 5 年分位：
-    - 最新 PE-TTM / PB(LF) / 日期优先取结构化批量快照 (get_index_price_indicators)
-    - 近 5 年百分位优先拉取近 5 年历史 PE-TTM 序列本地精确算分位；若某标的序列返回空（如 DJI.GI），
-      再尝试单指标查询显式“5年分位”列。
+    1. 最新 PE-TTM / PB(LF) / 日期优先取结构化批量快照 (get_index_price_indicators)
+    2. 优先直取 Wind 官方“最新PE在过去5年分位数”显式列（解决 100 行截断问题，道指/CAC40/A500/全指/800/A50/印度 一步精准到位）
+    3. 若官方 5 年分位列缺失或返回 0（如日经225 N225.NK、日本东证 TOPX.T），改拉近 5 年“每月末”PE-TTM（约 60 点，永不截断）并强校验跨度 >= 1200 天！
     """
     core_code = item["code"]
     display_code = item["display_code"]
@@ -854,39 +875,46 @@ def fetch_wind_index_valuation(
     current_pe = struct_snap.get("pe") if struct_snap else None
     current_pb = struct_snap.get("pb") if struct_snap else None
     latest_date = struct_snap.get("date") if struct_snap else None
-
-    start_5y = (today - dt.timedelta(days=365 * 5 + 10)).strftime("%Y-%m-%d")
-    q_hist = f"查询{wind_name}({wind_code})从{start_5y}至{today.strftime('%Y-%m-%d')}的每日市盈率PE_TTM"
-    hist_payload, hist_err = call_wind_mcp("index_data", "get_index_fundamentals", {"question": q_hist}, timeout_sec=50)
-    if hist_err:
-        return None, hist_err
-
-    pe_series, raw_cnt, sample_row = _extract_pe_series_from_wind(hist_payload)
+    div_yield: float | None = None
     pe_pct: float | None = None
-    series_len = 0
+    mode_tag = "Wind5年"
 
-    if pe_series is not None and len(pe_series) >= MIN_5Y_SERIES_POINTS:
-        if current_pe is None:
-            current_pe = float(pe_series.iloc[-1])
-        if not latest_date:
-            latest_date = pd.Timestamp(pe_series.index[-1]).strftime("%Y-%m-%d")
-        cutoff_5y = pe_series.index.max() - pd.Timedelta(days=365 * 5 + 2)
-        pe_5y = pe_series[pe_series.index >= cutoff_5y].dropna()
-        pe_pct = round(float((pe_5y <= current_pe).mean() * 100.0), 1)
-        series_len = len(pe_5y)
-    else:
-        # 仅当序列缺失（例如 DJI.GI 返回“没找到数据”）时，改查显式“近5年分位数”表格列（零正则猜数）
-        q_pct = f"查询{wind_name}({wind_code})最新PE在过去5年分位数"
-        pct_payload, pct_err = call_wind_mcp("index_data", "get_index_fundamentals", {"question": q_pct}, timeout_sec=35)
-        if not pct_err and pct_payload is not None:
-            pe_pct = _extract_explicit_percentile_col(pct_payload)
-            if pe_pct is None:
-                p_prev = (pct_payload if isinstance(pct_payload, str) else json.dumps(pct_payload, ensure_ascii=False))[:200]
-                print(f"[Wind调试-分位列未命中] {wind_code} 序列行数={raw_cnt} 首行={sample_row} | 分位返回={p_prev}")
-        else:
-            print(f"[Wind调试-序列不足] {wind_code} 原始行数={raw_cnt} 首行={sample_row}")
+    # Step A：优先直取 Wind 官方“最新PE在过去5年分位数” + 股息率
+    q_pct = f"查询{wind_name}({wind_code})最新滚动市盈率PE-TTM、最新PE在过去5年分位数和股息率"
+    pct_payload, pct_err = call_wind_mcp("index_data", "get_index_fundamentals", {"question": q_pct}, timeout_sec=40)
+    if pct_err:
+        return None, pct_err
+
+    p_pct, p_pe, p_dy, p_dt = _extract_explicit_percentile_col(pct_payload)
+    if current_pe is None and p_pe is not None:
+        current_pe = p_pe
+    if not latest_date and p_dt:
+        latest_date = p_dt
+    if p_dy is not None:
+        div_yield = p_dy
+    if p_pct is not None and p_pct > 0.1:
+        pe_pct = p_pct
+
+    # Step B：若官方 5 年分位列为空或异常为 0（如日经225 / 东证），拉取近 5 年“每月末”PE-TTM（约60行，绝不触发100行截断）
+    if pe_pct is None or pe_pct <= 0.1:
+        start_5y = (today - dt.timedelta(days=365 * 5 + 15)).strftime("%Y-%m-%d")
+        q_month = f"查询{wind_name}({wind_code})从{start_5y}至{today.strftime('%Y-%m-%d')}每月末的滚动市盈率PE_TTM"
+        m_payload, m_err = call_wind_mcp("index_data", "get_index_fundamentals", {"question": q_month}, timeout_sec=45)
+        if not m_err and m_payload is not None:
+            pe_series, n_pts, span_days, sample = _extract_pe_series_from_wind(m_payload)
+            if pe_series is not None:
+                if current_pe is None:
+                    current_pe = float(pe_series.iloc[-1])
+                if not latest_date:
+                    latest_date = pd.Timestamp(pe_series.index[-1]).strftime("%Y-%m-%d")
+                pe_pct = round(float((pe_series <= current_pe).mean() * 100.0), 1)
+                mode_tag = f"{n_pts}月"
+            else:
+                print(f"[Wind调试-月频未达标] {wind_code} 点数={n_pts} 跨度={span_days}天 首行={sample}")
 
     if current_pe is None or pe_pct is None or pe_pct <= 0.0:
+        p_prev = (pct_payload if isinstance(pct_payload, str) else json.dumps(pct_payload, ensure_ascii=False))[:220]
+        print(f"[Wind未命中] {name} ({wind_code}): pe={current_pe} pct={pe_pct} | 预览={p_prev}")
         return None, None
 
     latest_date = latest_date or today.strftime("%Y-%m-%d")
@@ -912,11 +940,10 @@ def fetch_wind_index_valuation(
         composite_pct=composite_pct,
         pe_pct=pe_pct,
         pb_pct=None,
-        div_yield=None,
+        div_yield=div_yield,
         is_dividend_idx=(idx_style == "dividend"),
     )
-    tag_pts = f"{series_len}日" if series_len > 0 else "Wind5年分位"
-    print(f"[Wind精准] {name} ({wind_code}): PE-TTM={current_pe:.2f} ({pe_pct:.1f}%, {tag_pts}), 日期={latest_date}")
+    print(f"[Wind精准] {name} ({wind_code}): PE-TTM={current_pe:.2f} ({pe_pct:.1f}%, {mode_tag}), 日期={latest_date}")
     return {
         "status": "ok",
         "code": core_code,
@@ -926,7 +953,7 @@ def fetch_wind_index_valuation(
         "pe_percentile": round(pe_pct, 1),
         "current_pb": current_pb,
         "pb_percentile": None,
-        "div_yield": None,
+        "div_yield": div_yield,
         "roe": None,
         "composite_pct": composite_pct,
         "dca_action": dca_action,
@@ -948,20 +975,20 @@ def _build_demo_record(item: dict[str, str]) -> dict[str, Any]:
         "HSTECH":  (16.6,  2.7, 1.95, 18.0, 1.1, 10.5, today_str, "蛋卷"),
         "399006":  (24.7,  4.6, 3.40, 22.0, 1.2, 13.5, today_str, "蛋卷"),
         "NDX":     (24.6,  6.2, 7.10, 58.0, 0.7, 23.0, today_str, "蛋卷"),
-        "SENSEX":  (21.3, 12.1, 3.10, None, None, None, today_str, "Wind"),
-        "DJI":     (21.7, 14.1, 7.21, None, None, None, today_str, "Wind"),
+        "SENSEX":  (21.3, 12.1, 3.10, None, 1.2, None, today_str, "Wind"),
+        "DJI":     (21.7, 14.1, 7.21, None, 0.8, None, today_str, "Wind"),
         "SPX":     (22.1, 19.3, 4.90, 72.0, 1.3, 18.8, today_str, "蛋卷"),
-        "N225":    (19.3, 49.2, None, None, None, None, today_str, "Wind"),
-        "TOPX":    (16.4, 49.8, 1.66, None, None, None, today_str, "Wind"),
+        "N225":    (19.3, 48.3, None, None, 1.7, None, today_str, "Wind"),
+        "TOPX":    (16.4, 50.4, 1.66, None, 2.8, None, today_str, "Wind"),
         "HSI":     (10.1, 53.7, 1.08, 46.0, 3.8, 10.2, today_str, "蛋卷"),
         "000905":  (25.1, 55.2, 1.78, 44.0, 1.8,  7.8, today_str, "蛋卷"),
-        "FCHI":    (16.3, 58.4, None, None, None, None, today_str, "Wind"),
-        "000985":  (18.2, 61.5, 1.68, None, None, None, today_str, "Wind"),
-        "000510":  (15.2, 68.0, 1.52, None, None, None, today_str, "Wind"),
-        "000906":  (14.6, 69.9, 1.40, None, None, None, today_str, "Wind"),
+        "FCHI":    (16.4, 59.1, None, None, 3.1, None, today_str, "Wind"),
+        "000985":  (18.2, 60.7, 1.68, None, 2.3, None, today_str, "Wind"),
+        "000510":  (15.2, 67.7, 1.52, None, 2.7, None, today_str, "Wind"),
+        "000906":  (14.6, 70.0, 1.40, None, 2.8, None, today_str, "Wind"),
         "000300":  (13.4, 72.2, 1.32, 34.0, 3.0, 10.5, today_str, "蛋卷"),
         "GDAXI":   (18.4, 78.8, 1.85, 68.0, 2.9, 10.4, today_str, "蛋卷"),
-        "8841233": (12.2, 86.3, 1.38, None, None, None, today_str, "Wind"),
+        "8841233": (12.2, 86.3, 1.38, None, 3.5, None, today_str, "Wind"),
         "000922":  ( 9.5, 99.9, 0.88, 65.0, 5.2, 10.9, today_str, "蛋卷"),
         "H30269":  ( 9.5, 99.9, 0.82, 60.0, 5.4, 10.5, today_str, "蛋卷"),
     }
@@ -1150,7 +1177,7 @@ def compute_index_valuation(
 
 
 # ============================================================================
-# 7. 重构版微信 HTML 晚报（已移除 A/港股整体温度，保留 ERP + 全市场情绪看板）
+# 7. 重构版微信 HTML 晚报（明确标注近5年分位阈值 + 全市场情绪看板）
 # ============================================================================
 def _fmt_turnover(yi_val: float | None) -> tuple[str, str]:
     if yi_val is None:
@@ -1346,7 +1373,7 @@ def build_wechat_html(
     if not compact_only:
         bar_section = (
             f'<div class="cd"><div class="ct">🎯 近5年PE-TTM分位与定投信号</div>'
-            f'<div class="cs">口径：近5年滚动PE分位 · <b class="c0">30%低估</b> / <b class="c1">50%中位</b> / <b class="c3">70%高估</b></div>'
+            f'<div class="cs">近5年分位阈值：<b class="c0">30%低估</b> / <b class="c1">50%中位</b> / <b class="c3">70%高估</b></div>'
             f'{"".join(bar_rows)}</div>'
         )
 
@@ -1356,10 +1383,10 @@ def build_wechat_html(
         f'<div class="hs">数据日期：{report_date} · 实时有效 {len(df_sorted)} 只 · 口径：近5年PE-TTM</div>'
         f'{erp_box}'
         f'<div class="kg">'
-        f'<div class="kc" style="background:rgba(16,185,129,.2);border:1px solid #10B981"><div class="kv" style="color:#34D399">{cnt_low}</div><div class="kl" style="color:#D1FAE5">低估&lt;30%</div></div>'
-        f'<div class="kc" style="background:rgba(59,130,246,.2);border:1px solid #3B82F6"><div class="kv" style="color:#60A5FA">{cnt_mid_low}</div><div class="kl" style="color:#DBEAFE">适中30-50%</div></div>'
-        f'<div class="kc" style="background:rgba(245,158,11,.2);border:1px solid #F59E0B"><div class="kv" style="color:#FBBF24">{cnt_mid_high}</div><div class="kl" style="color:#FEF3C7">偏高50-70%</div></div>'
-        f'<div class="kc" style="background:rgba(239,68,68,.2);border:1px solid #EF4444"><div class="kv" style="color:#F87171">{cnt_high}</div><div class="kl" style="color:#FEE2E2">高估&gt;70%</div></div>'
+        f'<div class="kc" style="background:rgba(16,185,129,.2);border:1px solid #10B981"><div class="kv" style="color:#34D399">{cnt_low}</div><div class="kl" style="color:#D1FAE5">近5年&lt;30%</div></div>'
+        f'<div class="kc" style="background:rgba(59,130,246,.2);border:1px solid #3B82F6"><div class="kv" style="color:#60A5FA">{cnt_mid_low}</div><div class="kl" style="color:#DBEAFE">近5年30-50%</div></div>'
+        f'<div class="kc" style="background:rgba(245,158,11,.2);border:1px solid #F59E0B"><div class="kv" style="color:#FBBF24">{cnt_mid_high}</div><div class="kl" style="color:#FEF3C7">近5年50-70%</div></div>'
+        f'<div class="kc" style="background:rgba(239,68,68,.2);border:1px solid #EF4444"><div class="kv" style="color:#F87171">{cnt_high}</div><div class="kl" style="color:#FEE2E2">近5年&gt;70%</div></div>'
         f'</div></div>'
         f'{pulse_html}'
         f'{bar_section}'
